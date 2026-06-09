@@ -38,8 +38,9 @@ alone nor a stray trigger alone may destroy data. The **correct password always 
 wipes (REQ-4; `SPEC.md` §6 invariants). All "are you sure?" friction lives at **provisioning time**
 in `host/provision.py`; once a trigger legitimately fires, the wipe is fast and non-abortable so a
 coercer cannot interrupt it (REQ-10). Per the user's standing directive, **reliability beats
-power**: an undervoltage/brown-out boot is treated as DISARMED upstream (`SPEC.md` §13), and any
-ambiguous arming read is treated as NOT-ARMED.
+power**: a brownout/undervoltage boot **suppresses destruction (never wipes) but still REQUIRES the
+correct password to boot** — no gate bypass (`SPEC.md` §13, `THREAT-MODEL.md` "Brownout
+weaponization"), and any ambiguous arming read is treated as NOT-ARMED.
 
 ---
 
@@ -375,8 +376,11 @@ mishandled, so the flasher gates T2 behind a separate, blocking warning (§9).
 
 Password verification is **PBKDF2-HMAC-SHA256** via mbedtls (bundled with Arduino-ESP32). Argon2id
 is infeasible — OWASP's 19 MiB minimum exceeds ESP32 RAM (`GateCrypto.h`). Host and device must
-agree on `{salt, iter, dklen}`; defaults `iter=150000`, `dklen=32`, tuned so a verify takes
-~0.3–0.8 s on the target chip and recorded in `guardcfg.kdf_iter`. `verify()` uses a **constant-time**
+agree on `{salt, iter, dklen}`; defaults `iter=10000`, `dklen=32`, tuned so a verify takes ~1 s on the
+target chip (`150000` measured ≈16.7 s on a classic ESP32 — far too slow for a boot gate) and recorded
+in `guardcfg.kdf_iter`. The low count is correct here: the gate wipes after `max_att` wrong tries so
+online brute-force is moot, and PBKDF2 is GPU-cheap so a high count buys no offline protection for the
+(dumpable on T1) hash — real protection is T2 + a strong passphrase, not iteration count (`SPEC.md` §9). `verify()` uses a **constant-time**
 compare (`GateCrypto::ctEqual`). The **plaintext password is never stored, never logged, never a CLI
 argument**; only `{salt, pwhash, kdf_iter, kdf_dklen}` exist on device, and both host and firmware
 zeroize the password buffer immediately after hashing (`SPEC.md` §4, §9, §10).
@@ -441,7 +445,7 @@ straight from the manifest). The full list:
 | T1 vs T2 | build both; T1 default, T2 opt-in | §7, flasher §9 |
 | LGPL `ESPAsyncWebServer` static-link distribution | legal note before redistributing binaries | `docs/LICENSING.md` |
 | SD remanence (FTL) | documented best-effort, not guaranteed | §6, `SAFETY.md` |
-| Low-battery boot policy | undervoltage boot ⇒ treat as DISARMED (reliability-first) | `BootGate` / `GateConfig` |
-| KDF iteration tuning | default 150000, tune on target | §8, `SPEC.md` §9 |
+| Low-battery boot policy | brownout/undervoltage boot SUPPRESSES destruction (never wipes) but the CORRECT PASSWORD IS STILL REQUIRED to boot — no bypass (reliability-first) | `BootGate` / `GateConfig`, `THREAT-MODEL.md` |
+| KDF iteration tuning | default 10000, tune on target for ~1 s UX | §8, `SPEC.md` §9 |
 </content>
 </invoke>

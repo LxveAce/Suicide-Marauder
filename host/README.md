@@ -35,8 +35,9 @@ stored `{salt, kdf_iter, kdf_dklen}` and compares constant-time against `pwhash`
 
 - Algorithm: **PBKDF2-HMAC-SHA256** (stdlib `hashlib.pbkdf2_hmac('sha256', pw, salt, iter, 32)`).
 - `salt = os.urandom(16)` — 16 bytes, fresh per device.
-- `kdf_iter` default **150000** (`--kdf-iter` to tune; pick a value where an on-device verify takes
-  ~0.3–0.8 s on the target chip, then keep host + device identical).
+- `kdf_iter` default **10000** (matches `provision.py` `DEFAULT_KDF_ITER` and SPEC §9; `--kdf-iter`
+  to tune; ~1 s verify on a classic ESP32 — `150000` measured ≈16.7 s, far too slow for a boot gate.
+  Keep host + device identical).
 - `kdf_dklen = 32`.
 
 **Argon2id is intentionally not used** — OWASP's 19 MiB minimum exceeds ESP32 RAM (SPEC §9).
@@ -88,7 +89,7 @@ python provision.py \
   --max-att 2 --deadman 1 \
   --wipe-ota 1 --wipe-nvs 1 --wipe-spiffs 1 --wipe-sd 1 --sd-passes 1 \
   --brick 0 \
-  --kdf-iter 150000 \
+  --kdf-iter 10000 \
   --armed 0
 ```
 
@@ -110,7 +111,7 @@ python provision.py \
 | `--wipe-sd {0,1}` | `wipe_sd` | `1` | overwrite + erase SD |
 | `--sd-passes N` | `sd_passes` | `1` | SD overwrite passes (extra passes give no real gain on flash) |
 | `--brick {0,1}` | `brick` | `0` | erase boot chain last for a true brick (T2 sets 1) |
-| `--kdf-iter N` | `kdf_iter` | `150000` | PBKDF2 iterations — must match the device |
+| `--kdf-iter N` | `kdf_iter` | `10000` | PBKDF2 iterations — must match the device (SPEC §9) |
 | `--no-confirm` | — | off | skip the password confirmation prompt |
 | `--nvs-gen-dir DIR` | — | auto | directory holding a vendored `nvs_partition_gen.py` |
 

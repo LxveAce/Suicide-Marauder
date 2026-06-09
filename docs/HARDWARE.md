@@ -94,9 +94,11 @@ widen the sampling window (RESEARCH-DIGEST: *Reading reliably AT BOOT … sample
 any non-confirmed-armed result as disarmed*). The default values are `arm_level=1` (HIGH),
 `arm_pull=2` (pulldown), `deadman=1` (`SPEC.md` §4).
 
-**Brown-out / undervoltage caveat:** a low-battery boot (common on StickC / Cardputer) is treated as
-**DISARMED upstream** (reliability-first; `SPEC.md` §13, `ARCHITECTURE.md` §1) so an undervoltage boot
-can never accidentally trip the wipe.
+**Brown-out / undervoltage caveat:** a low-battery boot (common on StickC / Cardputer) **SUPPRESSES
+destruction (never wipes) but the CORRECT PASSWORD IS STILL REQUIRED to boot** — no gate bypass
+(reliability-first; `SPEC.md` §13, `ARCHITECTURE.md` §1, `THREAT-MODEL.md` "Brownout weaponization").
+The sagging rail's arming line is not read and the wipe cannot fire, but the device does not open: the
+gate still demands the password.
 
 **Optional hardening (the obvious bypass).** A determined attacker who opens the case could short the
 pin straight to 3.3 V to hold it "armed." To resist that, replace the bare switch with a

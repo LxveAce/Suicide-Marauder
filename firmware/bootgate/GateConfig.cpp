@@ -66,14 +66,17 @@ void getU32(nvs_handle_t h, const char* key, uint32_t* dst) {
   }
 }
 
-// Open the runtime namespace (read/write). Mirrors the config-partition fallback logic. Declared
-// here (ahead of GateConfig::load) so load() can peek the wipe tombstone in `sgate_rt`.
+// Open the runtime namespace (read/write). Declared here (ahead of GateConfig::load) so load() can
+// peek the wipe tombstone in `sgate_rt`.
+//
+// TOMBSTONE PARTITION PINNING (SPEC §8, red-team round 2): `sgate_rt` — which holds the wipe-in-
+// progress tombstone (wipe_armed) and the resume bound (resume_count) — is read AND written ONLY in
+// the dedicated `guardcfg` partition. There is deliberately NO fallback to the DEFAULT `nvs`
+// partition here: a stray/foreign `sgate_rt` namespace sitting in the default partition must never be
+// able to drive a false wipe-resume. If guardcfg cannot be opened we return the error and the caller
+// fails safe (tombstone reads as absent; counter writes are skipped — monotonic, never a reset).
 esp_err_t openRuntime(nvs_open_mode_t mode, nvs_handle_t* h) {
-  esp_err_t err = nvs_open_from_partition("guardcfg", NVS_NS_RT, mode, h);
-  if (err != ESP_OK) {
-    err = nvs_open(NVS_NS_RT, mode, h);
-  }
-  return err;
+  return nvs_open_from_partition(GUARDCFG_PART, NVS_NS_RT, mode, h);
 }
 
 // Helper: read a fixed-size blob into dst, returning true iff the stored blob is exactly `len`
@@ -113,13 +116,15 @@ GateConfig GateConfig::load() {
     return cfg;
   }
 
-  // ---- schema version (SPEC §4.1: read and validate; unknown version => NOT provisioned) ----
-  // A schema this firmware does not understand must never be allowed to drive a wipe. Treat a
-  // missing cfg_ver as the canonical CFG_VERSION (older provisioner that predates the key) but treat
-  // any *present-and-different* version as fail-safe non-provisioned.
-  uint8_t cfgVer = CFG_VERSION;
-  getU8(h, "cfg_ver", &cfgVer);
-  bool versionOk = (cfgVer == CFG_VERSION);
+  // ---- schema version (SPEC §4.1: read and validate; unknown/missing version => NOT provisioned) --
+  // A schema this firmware does not understand must never be allowed to drive a wipe. provision.py
+  // now ALWAYS emits cfg_ver (SPEC §4.1 intent), so the key must be PRESENT and == CFG_VERSION:
+  // a MISSING cfg_ver is treated as NOT provisioned (a board image that predates the key, or a
+  // partly-written/foreign config, can never drive a wipe). versionOk requires both presence and a
+  // recognized value.
+  uint8_t cfgVer = 0;
+  bool haveVer = (nvs_get_u8(h, "cfg_ver", &cfgVer) == ESP_OK);
+  bool versionOk = haveVer && (cfgVer == CFG_VERSION);
 
   // ---- crypto material (load-bearing for provisioned-ness) ----
   bool haveSalt = getBlobExact(h, "salt", cfg.salt, SALT_LEN);
@@ -204,7 +209,8 @@ GateRuntime GateRuntime::load() {
 
   getU8(h, "att_ct", &rt.att_ct);
   getU32(h, "lock_until", &rt.lock_until);
-  getU8(h, "wipe_armed", &rt.wipe_armed);  // SPEC §8 tombstone (reflect flash state in the struct)
+  getU8(h, "wipe_armed", &rt.wipe_armed);     // SPEC §8 tombstone (reflect flash state in the struct)
+  getU8(h, "resume_count", &rt.resume_count); // SPEC §8 (red-team round 2): DESTRUCTIVE-resume bound
 
   nvs_close(h);
   return rt;
@@ -292,6 +298,96 @@ bool GateRuntime::clearWipeTombstone() {
   esp_err_t e2 = nvs_commit(h);
   nvs_close(h);
   return e1 == ESP_OK && e2 == ESP_OK;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DESTRUCTIVE-resume bound (SPEC §8 robustness, red-team round 2).
+//
+// Persist the (already-incremented) in-RAM resume_count to `sgate_rt` BEFORE each resume
+// SelfDestruct so the bound advances even if THIS resume is itself power-interrupted — without it an
+// endlessly-interrupted resume could spin forever (or prematurely brick). Pinned to guardcfg via
+// openRuntime(). LOG-ONLY no-op under SUICIDE_SAFE_MODE (a dry run must never write a real counter).
+// ---------------------------------------------------------------------------
+bool GateRuntime::commitResumeCount() {
+#if defined(SUICIDE_SAFE_MODE)
+  ESP_LOGW(TAG, "[SAFE] would persist resume_count=%u (sgate_rt) — NO-OP (no NVS write)",
+           (unsigned)resume_count);
+  return true;
+#else
+  ensureNvsReady();
+
+  nvs_handle_t h;
+  if (openRuntime(NVS_READWRITE, &h) != ESP_OK) {
+    return false;
+  }
+  esp_err_t e1 = nvs_set_u8(h, "resume_count", resume_count);
+  esp_err_t e2 = nvs_commit(h);  // commit NOW — the bound must be on flash before the erase begins
+  nvs_close(h);
+  return e1 == ESP_OK && e2 == ESP_OK;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Residual-tombstone CLEANUP (SPEC §8 / §6, red-team round 2).
+//
+// Reached ONLY on an UNPROVISIONED or MASTER-DISARMED board that nonetheless carries a tombstone.
+// Such a board can NEVER wipe (hard invariant), so the tombstone is residue (foreign/aborted state),
+// not a genuine interrupted wipe. We clear the runtime tombstone + resume bound AND erase any
+// leftover `sgate` config residue in guardcfg so a later boot cannot misread stale state — then the
+// caller continues to GATE_PASS. We NEVER SelfDestruct here.
+//
+// Scoped to the `guardcfg` partition ONLY (never the default `nvs`). LOG-ONLY no-op under
+// SUICIDE_SAFE_MODE: zero real erases (SPEC §5/§8). Returns true iff the real cleanup succeeded.
+// ---------------------------------------------------------------------------
+bool GateRuntime::cleanupResidualTombstone() {
+  wipe_armed = 0;
+  resume_count = 0;
+#if defined(SUICIDE_SAFE_MODE)
+  ESP_LOGW(TAG, "[SAFE] would CLEANUP residual tombstone + sgate residue in guardcfg "
+                "(wipe_armed=0, resume_count=0, erase sgate ns) — NO-OP (no NVS write/erase)");
+  return true;
+#else
+  ensureNvsReady();
+
+  // 1) Clear the runtime tombstone + resume bound in `sgate_rt`.
+  bool ok = true;
+  {
+    nvs_handle_t rh;
+    if (openRuntime(NVS_READWRITE, &rh) == ESP_OK) {
+      esp_err_t e1 = nvs_set_u8(rh, "wipe_armed", 0);
+      esp_err_t e2 = nvs_set_u8(rh, "resume_count", 0);
+      esp_err_t e3 = nvs_commit(rh);
+      nvs_close(rh);
+      ok = (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK);
+    } else {
+      ok = false;
+    }
+  }
+
+  // 2) Erase any leftover `sgate` config residue, scoped to the guardcfg partition. nvs_erase_all
+  //    wipes only the OPEN namespace (`sgate`) in this partition — it never touches Marauder's
+  //    default `nvs` partition or the runtime counter namespace.
+  {
+    nvs_handle_t ch;
+    if (nvs_open_from_partition(GUARDCFG_PART, NVS_NS_CFG, NVS_READWRITE, &ch) == ESP_OK) {
+      esp_err_t e1 = nvs_erase_all(ch);  // ESP_ERR_NVS_NOT_FOUND is fine (already empty)
+      esp_err_t e2 = nvs_commit(ch);
+      nvs_close(ch);
+      if (e1 != ESP_OK && e1 != ESP_ERR_NVS_NOT_FOUND) {
+        ok = false;
+      }
+      if (e2 != ESP_OK) {
+        ok = false;
+      }
+    }
+    // If the `sgate` namespace cannot be opened there is simply no config residue to erase; not an
+    // error for cleanup purposes.
+  }
+
+  ESP_LOGW(TAG, "residual tombstone CLEANUP on unprovisioned/disarmed board (no wipe) -> %s",
+           ok ? "ok" : "partial");
+  return ok;
 #endif
 }
 

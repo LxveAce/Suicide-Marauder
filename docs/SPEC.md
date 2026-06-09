@@ -376,5 +376,25 @@ Tooltip copy lives in one place per front-end so it stays consistent and is easy
 | T1 vs T2 (Secure Boot/FE) | decision: build both, T1 default, T2 opt-in | `§8`, flasher `§11` |
 | GPL/LGPL distribution (ESPAsyncWebServer LGPL static link) | needs legal note before redistributing binaries | `docs/LICENSING.md` |
 | SD remanence (FTL) | documented best-effort, not guaranteed | `§8`, `SAFETY.md` |
-| Low-battery boot policy | **undervoltage boot ⇒ treat as DISARMED** (reliability-first) | `BootGate` / `GateConfig` |
+| Low-battery boot policy | **brownout/undervoltage boot SUPPRESSES destruction (never wipes), but the CORRECT PASSWORD IS STILL REQUIRED to boot** (no bypass) — reliability-first *without* a free gate skip | `BootGate` / `GateConfig`, `THREAT-MODEL.md` (brownout weaponization) |
 | KDF iteration tuning | default 10000, tune on target for ~1 s UX | `§9` |
+| Supply chain (flash-time trust + tool pinning) | flash host is trusted at flash time; firmware/tools pinned toward known-good versions | `§14`, `THREAT-MODEL.md` |
+
+---
+
+## 14. Supply chain — flash-time trust and tool pinning
+
+The provisioning/flash host is part of the **trusted computing base at flash time**: it types and
+hashes the password, runs `provision.py`/`nvs_partition_gen`/`esptool`, and writes the bundle. A
+compromised host at flash time can substitute firmware, weaken the config, or capture the password
+**before** any on-device protection exists — no on-device control can defend against a hostile
+flasher. So flash only from a host you trust, over a known-good toolchain.
+
+To shrink that window, the host tools and firmware images should be **pinned toward exact/known-good
+versions** rather than floating: `esptool`, `esp-idf-nvs-partition-gen`, `pyserial`, and the suicide
+build `.bin`s. `host/requirements.txt` (provisioner) and `headless-marauder-gui/requirements.txt`
+(flasher) pin toward known-good versions today; the **next hardening step** is to add wheel hashes
+(`pip install --require-hashes`) and pin firmware bundles by signed tag / out-of-band digest. This
+complements the bundle integrity note in `THREAT-MODEL.md`: a `sha256` co-located in the same
+`bundle.json` guards against corruption/accident, not a determined attacker — real integrity needs an
+**out-of-band/signed manifest**.

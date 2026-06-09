@@ -14,7 +14,11 @@
 
 namespace suicide {
 
-enum GateResult { GATE_PASS, GATE_TRIGGERED };
+// GATE_HALTED (SPEC §8, red-team round 2): a distinct, visibly-locked terminal halt. Used when the
+// DESTRUCTIVE-resume bound (MAX_WIPE_RESUMES) is exhausted — the gate stops re-triggering the wipe
+// (avoid an endless resume / premature-brick loop) and never returns control to Marauder. Unlike
+// GATE_TRIGGERED it does NOT erase; it just refuses to boot.
+enum GateResult { GATE_PASS, GATE_TRIGGERED, GATE_HALTED };
 
 enum TriggerReason {
   REASON_NONE = 0,
@@ -36,6 +40,19 @@ class BootGate {
   // (reliability-first: a flaky rail must NEVER cause a wipe). SPEC §13.
   static GateResult armedFlow(GateConfig& cfg, bool lowSupply);
   static void       backoff(uint32_t attempt);    // re-prompt pacing
+
+  // Wipe-resume helper (SPEC §8, red-team round 2). resumeWipe() decides what to do about a wipe-in-
+  // progress tombstone found at boot: a DESTRUCTIVE resume runs ONLY when the board is still
+  // provisioned AND armed AND not low-supply; an unprovisioned/disarmed board treats the tombstone as
+  // residue and CLEANS it (never wipes); a low-supply board DEFERS (keeps the tombstone, requires the
+  // password to boot). Returns GATE_TRIGGERED (destructive resume, does not return in practice on a
+  // real wipe), GATE_HALTED (resume bound exhausted), or GATE_PASS-equivalent handled by run().
+  // Updates `proceed` to tell run() whether to continue to the normal gate flow after a cleanup/defer.
+  static GateResult resumeWipe(GateConfig& cfg, bool lowSupply, bool& proceed);
+
+  // Distinct, visibly-locked terminal halt (GATE_HALTED). Does NOT erase and never returns to
+  // Marauder — used when the DESTRUCTIVE-resume bound is exhausted (SPEC §8).
+  static GateResult haltLocked(const char* why) __attribute__((noreturn));
 };
 
 } // namespace suicide

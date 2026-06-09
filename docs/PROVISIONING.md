@@ -43,7 +43,7 @@ no correct password will ever verify. From [`SPEC.md`](SPEC.md) §9 and the `sga
 | algorithm | PBKDF2-HMAC-SHA256 (mbedtls on device, `hashlib` on host) | implicit — not a stored field |
 | `salt` | `os.urandom(16)`, fresh per device | `salt` — `blob[16]` |
 | `pwhash` | `pbkdf2_hmac('sha256', pw, salt, kdf_iter, kdf_dklen)` | `pwhash` — `blob[32]` |
-| `kdf_iter` | default **150000**; tune so a verify takes ~0.3–0.8 s on the target chip | `kdf_iter` — `u32` |
+| `kdf_iter` | default **10000** (matches `provision.py` `DEFAULT_KDF_ITER` and SPEC §9; ~1 s verify on classic ESP32 — `150000` measured ≈16.7 s, far too slow); tune for boot-gate UX | `kdf_iter` — `u32` |
 | `kdf_dklen` | **32** | `kdf_dklen` — `u8` |
 | `cfg_ver` | **1** | `cfg_ver` — `u8` |
 
@@ -70,7 +70,7 @@ Canonical `sgate` keys (defaults from SPEC §4 — change deliberately, per devi
 | `cfg_ver` | u8 | schema version | `1` |
 | `salt` | blob[16] | PBKDF2 salt | generated |
 | `pwhash` | blob[32] | PBKDF2 hash of your password | derived |
-| `kdf_iter` | u32 | PBKDF2 iterations | `150000` |
+| `kdf_iter` | u32 | PBKDF2 iterations | `10000` |
 | `kdf_dklen` | u8 | derived-key length | `32` |
 | `armed` | u8 | **master arm** (0=DISARMED, 1=ARMED) | **`0`** |
 | `arm_pin` | u8 | dead-man GPIO number | per board (SPEC §7; classic ESP32 = 27) |
@@ -114,7 +114,7 @@ python host/provision.py \
   --deadman 1 --max-attempts 2 \
   --armed 0 \
   --brick 0 \
-  --kdf-iter 150000 \
+  --kdf-iter 10000 \
   --out build/esp32_classic_suicide/
 # -> prompts: "Set gate password:" (hidden), "Confirm:"
 # -> writes guardcfg.bin, otadata_blank.bin, bundle.json
@@ -195,8 +195,9 @@ After SAFE_MODE has validated your config, provision a real (non-SAFE) build:
 5. Flash, power-cycle, and confirm the device prompts and unlocks with the correct password.
 
 Invariants that protect you even when armed (SPEC §6): a **correct password always boots and never
-wipes** (except the dead-man pre-check), and an **undervoltage/brownout boot is treated as DISARMED**
-(SPEC §13) so a low battery cannot spuriously trip the line.
+wipes** (except the dead-man pre-check), and a **brownout/undervoltage boot SUPPRESSES destruction
+(never wipes) but the CORRECT PASSWORD IS STILL REQUIRED to boot** (SPEC §13) — a low battery cannot
+spuriously trip the line, but it also does not open the device (no bypass).
 
 ---
 

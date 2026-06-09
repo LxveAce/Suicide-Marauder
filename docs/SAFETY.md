@@ -40,8 +40,10 @@ the thing you actually armed it to do.
   password alone gates boot and the line can **never** cause a wipe (it has *no* effect, not even to
   "keep the device locked"). The arming line only matters when `deadman=1`. Decide this consciously
   per device.
-- **Undervoltage / low-battery boot is treated as DISARMED** (reliability-first) to avoid a brownout
-  spuriously reading the arming line and wiping. Do not defeat this.
+- **A brownout / undervoltage / low-battery boot SUPPRESSES destruction (never wipes), but the
+  CORRECT PASSWORD IS STILL REQUIRED to boot** (no bypass — reliability-first). This stops a sagging
+  rail from spuriously reading the arming line and wiping, while never opening the device: the gate
+  still demands the password. Do not defeat this. (See `THREAT-MODEL.md` "Brownout weaponization.")
 - **The brick (boot-chain self-erase) is UNVERIFIED on hardware.** Do not enable `brick=1` on a board
   you care about until the spike in [`SPIKE-PLAN.md`](SPIKE-PLAN.md) has passed on a *sacrificial*
   board of the same chip/flash size. SAFE_MODE never performs the real brick.

@@ -18,8 +18,20 @@
 //     STILL required to boot (NO bypass): the dead-man pre-check is skipped and reaching max_att
 //     LOCKS/re-prompts forever instead of wiping. A brownout must NEVER cause a wipe (reliability-
 //     first, SPEC §13) and must NEVER hand out an unlocked board.
-//   * Wipe-in-progress tombstone (sgate_rt.wipe_armed) -> RESUME the interrupted self-destruct on
-//     the next boot (an interrupted wipe must finish, SPEC §8) — never a clean PASS over residual data.
+//   * Wipe-in-progress tombstone (sgate_rt.wipe_armed) -> CONDITIONAL resume (SPEC §8, red-team
+//     round 2). A tombstone triggers a DESTRUCTIVE resume ONLY when the board is STILL provisioned
+//     AND armed==1 AND NOT low-supply (a genuine interrupted wipe is always armed+provisioned and
+//     erases guardcfg LAST, so it still reads armed). Otherwise:
+//       - UNPROVISIONED or MASTER-DISARMED -> the board can never wipe: treat the tombstone as
+//         residual CLEANUP only (clear it + erase guardcfg residue) and continue to GATE_PASS;
+//         NEVER SelfDestruct. (Closes the force-wipe-over-disarmed DoS: a hand-written wipe_armed=1
+//         can no longer force a wipe on a disarmed/unprovisioned board.)
+//       - LOW-SUPPLY (brownout) -> DEFER: keep the tombstone, do NOT wipe this boot, and require the
+//         password to boot normally. A real interrupted wipe finishes on the next good-power boot
+//         (reliability-first, SPEC §13).
+//     The number of DESTRUCTIVE resumes is BOUNDED (MAX_WIPE_RESUMES): after the bound is exhausted
+//     the gate stops re-triggering and enters a distinct, visibly-locked halt (GATE_HALTED) instead
+//     of looping forever / prematurely bricking.
 //
 // The plaintext password buffer returned by suicide::Input::getPassword() is zeroized after every
 // verify() — never stored, never logged.
@@ -242,21 +254,33 @@ GateResult BootGate::armedFlow(GateConfig& cfg, bool lowSupply) {
 // before settings_obj.begin(); see firmware/integration/INTEGRATION.md).
 // ---------------------------------------------------------------------------------------------
 GateResult BootGate::run() {
-  // Step 1: load config from the `sgate` NVS namespace.
+  // Step 1: load config from the `sgate` NVS namespace (and peek the `sgate_rt` tombstone).
   GateConfig cfg = GateConfig::load();
 
-  // Step 1.5 (SPEC §8 robustness, red-team): RESUME an interrupted wipe. If the wipe-in-progress
-  // tombstone (`sgate_rt.wipe_armed`) is set, a previous self-destruct started and was cut short
-  // (power loss mid-erase). The board may now read as UNPROVISIONED (its guardcfg was partly
-  // erased) — but it must NOT report a clean PASS over residual data. Re-trigger SelfDestruct so the
-  // wipe FINISHES. This takes priority over every other branch, including the unprovisioned check
-  // below. (A real, interrupted wipe is already past the reliability-first "never initiate on a
-  // flaky rail" rule — the data is already partly gone; finishing it is the only safe end state.)
+  // Low-supply state is needed by BOTH the resume decision and the armed flow, so read it once up
+  // front. BROWNOUT-BYPASS FIX (SPEC §13): a low-supply/undervoltage boot must NEVER bypass the gate
+  // or fire the irreversible path — it only SUPPRESSES / DEFERS destruction.
+  const bool lowSupply = gateSupplyIsLow();
+  if (lowSupply) {
+    ESP_LOGW(TAG, "undervoltage/brownout boot: destruct SUPPRESSED/DEFERRED; password STILL required "
+                  "where applicable (no bypass) — reliability-first (SPEC §13)");
+  }
+
+  // Step 1.5 (SPEC §8 robustness, red-team round 2): handle a wipe-in-progress tombstone. The
+  // ordering FIX is the headline of this round: the tombstone is evaluated AGAINST the provisioned /
+  // armed / low-supply gates, NOT before them. A DESTRUCTIVE resume runs ONLY when the board is still
+  // provisioned AND armed AND not low-supply; otherwise it is residual cleanup (unprovisioned/
+  // disarmed) or a defer (low-supply). resumeWipe() either does not return (real destructive resume),
+  // returns GATE_HALTED (resume bound exhausted), or sets `proceed=true` to fall through to the
+  // normal gate flow below after a cleanup/defer.
   if (cfg.resumeWipe) {
-    ESP_LOGW(TAG, "wipe tombstone set (sgate_rt.wipe_armed=1) -> RESUMING interrupted self-destruct "
-                  "(SPEC §8). Will not report a clean PASS over residual data.");
-    SelfDestruct::trigger(cfg, REASON_ATTEMPTS);
-    return GATE_TRIGGERED;  // does not return in practice on a real wipe
+    bool proceed = false;
+    GateResult rr = resumeWipe(cfg, lowSupply, proceed);
+    if (!proceed) {
+      return rr;  // GATE_TRIGGERED (real wipe; does not return in practice) or GATE_HALTED.
+    }
+    // proceed == true: cleanup/defer done. cfg may now be unprovisioned (cleanup erased residue) or
+    // still provisioned+armed (low-supply defer). Fall through to the normal fail-safe gate flow.
   }
 
   // Step 2: FAIL-SAFE — an unprovisioned board behaves like plain Marauder and can never wipe.
@@ -273,19 +297,107 @@ GateResult BootGate::run() {
     return GATE_PASS;
   }
 
-  // BROWNOUT-BYPASS FIX (SPEC §13, red-team): a low-supply/undervoltage boot must NOT early-return
-  // GATE_PASS on an ARMED board — that would boot an armed board with NO password (a full gate
-  // bypass). Instead we pass the low-supply state INTO armedFlow, where it ONLY SUPPRESSES
-  // destruction (skip dead-man pre-check; lock-and-reprompt forever at max_att instead of wiping).
-  // The CORRECT password is STILL required to boot, and a brownout can never cause a wipe.
-  const bool lowSupply = gateSupplyIsLow();
-  if (lowSupply) {
-    ESP_LOGW(TAG, "undervoltage boot on ARMED board: destruct SUPPRESSED but password STILL "
-                  "required (no bypass) — reliability-first (SPEC §13)");
+  // Steps 5-7: master ARMED. armedFlow honors lowSupply to suppress (never bypass) destruction.
+  // (On a low-supply DEFER above we kept the tombstone and require the password here; a genuine
+  // interrupted wipe finishes on the next good-power boot via the destructive-resume branch.)
+  return armedFlow(cfg, lowSupply);
+}
+
+// ---------------------------------------------------------------------------------------------
+// resumeWipe — SPEC §8 (red-team round 2). Decide what to do about a wipe-in-progress tombstone.
+//
+// THE FIX: a set tombstone may trigger a DESTRUCTIVE resume ONLY when the board is still provisioned
+// AND armed==1 AND NOT low-supply. This preserves real interrupted-wipe resume (a genuine wipe is
+// always armed+provisioned and erases guardcfg LAST, so an interrupted wipe still reads armed) while
+// closing the force-wipe-over-disarmed DoS (a hand-written wipe_armed=1 can no longer force a wipe on
+// a disarmed/unprovisioned board) and the brownout-resume regression.
+//
+//   * UNPROVISIONED or MASTER-DISARMED -> CLEANUP only: the board can never wipe (hard invariant), so
+//     clear the tombstone + erase guardcfg residue and PROCEED to the normal gate flow (GATE_PASS).
+//     NEVER SelfDestruct.
+//   * LOW-SUPPLY -> DEFER: keep the tombstone, do not wipe this boot, PROCEED so the password gates
+//     the boot. The real wipe finishes on the next good-power boot (reliability-first, SPEC §13).
+//   * PROVISIONED + ARMED + good supply -> DESTRUCTIVE resume, BOUNDED by MAX_WIPE_RESUMES: after the
+//     bound is exhausted, stop re-triggering and enter the visibly-locked halt (GATE_HALTED) instead
+//     of an endless resume / premature-brick loop. The resume counter is persisted BEFORE the erase.
+//
+// `proceed` is set true ONLY for the cleanup/defer paths (caller falls through to the normal flow).
+// ---------------------------------------------------------------------------------------------
+GateResult BootGate::resumeWipe(GateConfig& cfg, bool lowSupply, bool& proceed) {
+  proceed = false;
+
+  // CLEANUP path: an unprovisioned or master-disarmed board can NEVER wipe. A tombstone here is
+  // residue (foreign/aborted state), not a genuine interrupted wipe. Clear it (+ erase guardcfg
+  // residue) and continue to GATE_PASS. NEVER SelfDestruct.
+  if (!cfg.provisioned || cfg.armed == 0) {
+    ESP_LOGW(TAG, "wipe tombstone on %s board -> residual CLEANUP only (NO wipe); clearing tombstone "
+                  "+ guardcfg residue, continuing to gate flow (SPEC §8/§6)",
+             cfg.provisioned ? "master-DISARMED" : "UNPROVISIONED");
+    GateRuntime rt = GateRuntime::load();
+    rt.cleanupResidualTombstone();  // clears wipe_armed + resume_count + erases sgate residue
+    cfg.resumeWipe = false;
+    // The cleanup may have erased the `sgate` config residue; reflect that the board is now
+    // unprovisioned so the fall-through flow PASSes cleanly. (If it was master-disarmed+provisioned,
+    // the disarmed branch still PASSes either way.)
+    if (!cfg.provisioned) {
+      scrubConfigSecrets(cfg);
+    }
+    cfg.provisioned = false;
+    proceed = true;
+    return GATE_PASS;  // value unused by caller when proceed==true
   }
 
-  // Steps 5-7: master ARMED. armedFlow honors lowSupply to suppress (never bypass) destruction.
-  return armedFlow(cfg, lowSupply);
+  // DEFER path: low-supply boot on a provisioned+armed board. A flaky rail must NEVER initiate or
+  // resume an irreversible wipe (reliability-first, SPEC §13). KEEP the tombstone; require the
+  // password to boot normally. A real interrupted wipe finishes on the next good-power boot.
+  if (lowSupply) {
+    ESP_LOGW(TAG, "wipe tombstone on ARMED board but LOW-SUPPLY boot -> DEFER resume (keep tombstone, "
+                  "NO wipe this boot; password required to boot) — reliability-first (SPEC §13)");
+    proceed = true;
+    return GATE_PASS;  // value unused by caller when proceed==true
+  }
+
+  // DESTRUCTIVE resume path: provisioned + armed + good supply. This is the genuine interrupted-wipe
+  // case. BOUND the number of resumes so a stuck/hostile condition cannot spin forever.
+  GateRuntime rt = GateRuntime::load();
+  if (rt.resume_count >= MAX_WIPE_RESUMES) {
+    ESP_LOGE(TAG, "wipe resume bound exhausted (resume_count=%u >= %u) -> GATE_HALTED "
+                  "(visibly locked; NO further erase) (SPEC §8)",
+             (unsigned)rt.resume_count, (unsigned)MAX_WIPE_RESUMES);
+    return haltLocked("wipe resume bound exhausted");  // does not return
+  }
+
+  // Increment + PERSIST the bound BEFORE the erase so an interrupted resume still advances the count
+  // (no infinite resume loop across power cycles).
+  if (rt.resume_count < 0xFF) {
+    rt.resume_count += 1;
+  }
+  rt.commitResumeCount();
+
+  ESP_LOGW(TAG, "wipe tombstone set on provisioned+ARMED board (good supply) -> RESUMING interrupted "
+                "self-destruct (resume %u/%u) (SPEC §8). Will not PASS over residual data.",
+           (unsigned)rt.resume_count, (unsigned)MAX_WIPE_RESUMES);
+  SelfDestruct::trigger(cfg, REASON_ATTEMPTS);
+  return GATE_TRIGGERED;  // does not return in practice on a real wipe
+}
+
+// ---------------------------------------------------------------------------------------------
+// haltLocked — distinct, visibly-locked terminal halt (GATE_HALTED). Does NOT erase and never hands
+// control back to Marauder. Used when the DESTRUCTIVE-resume bound is exhausted (SPEC §8): we must
+// not loop forever re-triggering the wipe, nor PASS over residual data, nor prematurely brick. Under
+// SUICIDE_SAFE_MODE this still just halts (it performs ZERO erases either way — it is purely a
+// refuse-to-boot state).
+// ---------------------------------------------------------------------------------------------
+GateResult BootGate::haltLocked(const char* why) {
+  ESP_LOGE(TAG, "GATE_HALTED: %s — refusing to boot (visibly locked; no erase)", why ? why : "");
+  Input::notifyLocked(0xFFFFFFFFu);  // cosmetic: indicate a terminal lock (best-effort)
+  for (;;) {
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+    delay(60000);
+#else
+    delay(1000);
+#endif
+  }
 }
 
 }  // namespace suicide

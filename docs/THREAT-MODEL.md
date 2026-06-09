@@ -46,10 +46,12 @@ The design deliberately biases away from accidental destruction:
   before any trigger is even evaluated.
 - **Correct password always wins** and never wipes, regardless of the arming line (except the
   dead-man pre-check, which is a hard hardware gate the owner explicitly enabled).
-- **Undervoltage boot ⇒ treated as DISARMED** so a brownout cannot spuriously trip the *destruct*
-  path (a flaky rail must never fire an irreversible erase or read the arming line). **It does NOT
-  open the device:** the password is still required to boot (see "Brownout weaponization" below). A
-  brownout boot only suppresses the wipe-capable armed flow, never the gate itself.
+- **Brownout/undervoltage boot SUPPRESSES destruction (never wipes), but the CORRECT PASSWORD IS
+  STILL REQUIRED to boot (no bypass).** A flaky rail must never fire an irreversible erase or read the
+  arming line, so the destruct-capable armed flow is suppressed — but the gate itself is **not**
+  skipped: the password is still demanded before boot (see "Brownout weaponization" below). A
+  brownout boot can at most degrade an armed board to "locked, password still required," never to
+  "open."
 - The one fail-*toward*-destruction behavior — a cut arming wire wiping an **armed** board — is the
   dead-man feature itself, is opt-out (`deadman=0`), and is loudly documented.
 
@@ -78,6 +80,17 @@ The design deliberately biases away from accidental destruction:
   - **`kdf_iter` downgrade.** Lowering `kdf_iter` in NVS (then re-deriving) cheapens an online
     re-guess; combined with the dumpable hash this only matters alongside a weak passphrase, but it
     is one more T1 NVS-tamper primitive.
+  - **Wipe-tombstone (`sgate_rt.wipe_armed`) — round-2 hardened.** The runtime tombstone the
+    firmware uses to make an interrupted wipe **resume** on the next boot is, on T1, just another
+    writable plaintext-NVS byte. Hand-setting it on a board that is **disarmed or unprovisioned** is
+    *not* a way to force a wipe: round 2 closes this — a tombstone found on a board that is not
+    `provisioned + master-armed` is treated as **CLEANUP-ONLY** (clear the stale tombstone and boot
+    normally), **never** a destructive trigger. A destructive *resume* requires the full destruct
+    preconditions all over again: **provisioned + master-armed + a good supply rail** (an
+    undervoltage/brownout boot suppresses the destruct-capable path per "Brownout weaponization"
+    below). So while an attacker can still *write* the byte on T1, on a disarmed/unprovisioned board
+    it can only cause a harmless cleanup, not data loss — it is listed here as a tamper *surface*,
+    not a bypass. (T2 makes it unwritable off-device like the rest of `guardcfg`/`sgate_rt`.)
 
   All of the above are **write/erase attacks on plaintext T1 NVS + flash**. **T2 (Secure Boot v2 +
   Flash Encryption) is the real mitigation:** it makes `guardcfg` unreadable/unwritable off-device,
@@ -93,9 +106,20 @@ The design deliberately biases away from accidental destruction:
   Encryption garbles it). Separately, suicide **bundles** were originally **trust-on-first-build**
   (the flasher wrote whatever `.bin`s were in the bundle dir with no integrity check); the flasher
   **now recomputes each image's SHA-256 and enforces it against the manifest** (`_sha256_file` +
-  the per-entry `sha256` check in `flash_suicide`), aborting on mismatch. Back-compat: an entry with
-  **no** `sha256` is still flashed but **warned** (TOFU) — older bundles predate the field; regenerate
-  the bundle so every entry carries a `sha256` to get enforcement.
+  the per-entry `sha256` check in `flash_suicide`), aborting on mismatch. **Round-2: every suicide
+  bundle entry now REQUIRES a `sha256`** — the old back-compat path that flashed a no-`sha256` entry
+  with only a TOFU *warning* is **closed**, so the "just strip the `sha256` field to downgrade to
+  trust-on-first-build" bypass no longer exists (a missing digest is now a hard abort; regenerate the
+  bundle with `provision.py` so every entry carries one).
+  - **What this `sha256` actually buys (corrected — it is NOT attacker-integrity).** The digest is
+    **co-located in the same `bundle.json`** that the bundle dir ships, and `bundle.json` is just as
+    tamperable as the `.bin`s it describes. So enforcing it protects against **corruption / accident /
+    a partial or swapped file** — it does **not** stop a *determined attacker* who simply edits a
+    `.bin` **and** regenerates the matching digest in `bundle.json` (the manifest is not signed). Real
+    image integrity requires an **out-of-band / signed manifest** (a signature the flasher verifies
+    against a key it did not get from the same bundle, or an externally published digest) — see the
+    supply-chain note in `SPEC.md` §14. The in-manifest `sha256` is an anti-corruption / anti-fumble
+    check and a TOFU floor, not a defense against a host or bundle that is already hostile.
 - **A recovered/cracked password is not just an unlock — it is also a force-wipe.** On a headless
   (`GATE_INPUT_SERIAL`) **armed** build the authenticated serial host-wipe (`wipe` → password →
   `REASON_HOST_WIPE`) triggers `SelfDestruct` on a **correct** password. So an attacker who recovers

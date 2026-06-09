@@ -40,6 +40,12 @@ static constexpr uint8_t  KDF_DKLEN   = 32;
 static constexpr uint8_t  SALT_LEN    = 16;
 static constexpr uint8_t  CFG_VERSION = 1;
 
+// Bound on DESTRUCTIVE wipe-resumes (SPEC §8 robustness, red-team round 2). An interrupted wipe
+// resumes on the next boot, but a hostile/stuck condition must not spin forever (endless resume /
+// premature-brick loop). After this many destructive resumes the gate stops re-triggering and enters
+// a distinct, visibly-locked halt (GATE_HALTED) instead of erasing again.
+static constexpr uint8_t  MAX_WIPE_RESUMES = 3;
+
 struct GateConfig {
   bool     provisioned = false;          // true iff a pwhash exists in NVS
 
@@ -79,6 +85,11 @@ struct GateRuntime {
                                          // self-destruct has started; cleared only on verified
                                          // completion). Survives power loss => resume an interrupted
                                          // wipe on the next boot.
+  uint8_t  resume_count = 0;             // SPEC §8 (red-team round 2): count of DESTRUCTIVE wipe-
+                                         // resumes already attempted. Incremented BEFORE each resume
+                                         // SelfDestruct. After MAX_WIPE_RESUMES the gate stops re-
+                                         // triggering and halts visibly (avoid endless resume /
+                                         // premature-brick loop). Survives power loss.
 
   static GateRuntime load();
   void commitAttempts();                 // persist att_ct BEFORE responding to a wrong attempt
@@ -91,6 +102,21 @@ struct GateRuntime {
   // Returns true iff the (real) NVS write+commit succeeded. SAFE-mode no-ops return true.
   bool setWipeTombstone();
   bool clearWipeTombstone();
+
+  // SPEC §8 (red-team round 2): persist the DESTRUCTIVE-resume counter to `sgate_rt`. Called with the
+  // already-incremented in-RAM resume_count BEFORE each resume SelfDestruct so an interrupted resume
+  // still advances the bound (no infinite resume loop across power cycles). LOG-ONLY no-op under
+  // SUICIDE_SAFE_MODE. Returns true iff the (real) NVS write+commit succeeded.
+  bool commitResumeCount();
+
+  // SPEC §8 / §6 (red-team round 2): residual-tombstone CLEANUP for the non-destructive path.
+  // When a tombstone is found on an UNPROVISIONED or MASTER-DISARMED board, that board can NEVER
+  // wipe (hard invariant), so the tombstone is treated as residue from a foreign/aborted state, not
+  // a real interrupted wipe: clear wipe_armed + resume_count AND erase any leftover `guardcfg` config
+  // (`sgate`) residue, then continue to GATE_PASS — NEVER SelfDestruct. Scoped to the guardcfg
+  // partition only (never the default `nvs`). LOG-ONLY no-op under SUICIDE_SAFE_MODE (zero real
+  // erases). Returns true iff the (real) cleanup succeeded.
+  bool cleanupResidualTombstone();
 };
 
 } // namespace suicide
