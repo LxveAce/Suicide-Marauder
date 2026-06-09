@@ -11,7 +11,7 @@
 # Placeholders in <angle brackets> are filled in by provision.py:
 #   <SALT_HEX>   = os.urandom(16).hex()                          (32 hex chars)
 #   <PWHASH_HEX> = pbkdf2_hmac('sha256', pw, salt, iter, 32).hex() (64 hex chars)
-#   <ITER>       = PBKDF2 iteration count (default 150000)
+#   <ITER>       = PBKDF2 iteration count (default 10000 ~= 1s verify on classic ESP32; SPEC §9)
 #   the u8 config values come from the CLI flags (defaults shown below).
 #
 # The PLAINTEXT password is NEVER present in this file -- only the salt and the salted hash.

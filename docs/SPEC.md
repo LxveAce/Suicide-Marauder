@@ -283,8 +283,14 @@ unrecoverable board whose ciphertext is gone.
 
 - **PBKDF2-HMAC-SHA256** via mbedtls (bundled with Arduino-ESP32). Argon2id is impossible (OWASP
   19 MiB min > ESP32 RAM).
-- Host and device MUST agree on `{iter, dklen, salt}`. Default `iter=150000`, `dklen=32`. Tune so a
-  verify takes ~0.3–0.8 s on the target chip; record the chosen value in `guardcfg.kdf_iter`.
+- Host and device MUST agree on `{iter, dklen, salt}`. **Default `iter=10000`** (≈1 s verify on a
+  classic ESP32-D0WD @240 MHz — **`150000` measured ≈16.7 s on hardware, far too slow** for a boot
+  gate), `dklen=32`. Record the chosen value in `guardcfg.kdf_iter`.
+  > **Why a low iteration count is correct here (measured).** The gate wipes after `max_att`
+  > (default 2) wrong tries, so *online* brute-force is impossible regardless of KDF cost. PBKDF2 is
+  > GPU-cheap, so a high count does **not** meaningfully protect the salted hash against an *offline*
+  > attacker who has dumped the flash — that protection is **T2 (Flash Encryption hides the hash) + a
+  > strong passphrase**, not iteration count. Tune `iter` purely for UX (~1 s).
 - `verify()` uses a **constant-time** compare (`mbedtls_ct`/manual) against `pwhash`.
 - Host: `hashlib.pbkdf2_hmac('sha256', pw, salt, iter, 32)`; `salt=os.urandom(16)`; zeroize `pw`.
 

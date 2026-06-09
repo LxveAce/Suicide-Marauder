@@ -30,7 +30,10 @@ static constexpr const char* NVS_NS_RT  = "sgate_rt";  // runtime counter (kept 
 #define SUICIDE_MAX_ATTEMPTS 2   // user spec: 2 wrong attempts -> wipe (when ARMED)
 #endif
 #ifndef SUICIDE_KDF_ITER
-#define SUICIDE_KDF_ITER 150000u
+// 10000 ~= 1s verify on a classic ESP32-D0WD @240MHz (MEASURED: 150000 ~= 16.7s — far too slow for
+// a boot gate). With the 2-attempt wipe, online brute-force is moot, so tune purely for UX; offline
+// hash resistance comes from T2 flash-encryption + a strong passphrase, not iteration count. SPEC §9.
+#define SUICIDE_KDF_ITER 10000u
 #endif
 
 static constexpr uint8_t  KDF_DKLEN   = 32;

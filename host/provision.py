@@ -39,7 +39,7 @@ NVS_NAMESPACE = "sgate"          # config namespace (GateConfig.h: NVS_NS_CFG)
 CFG_VERSION = 1                  # GateConfig.h: CFG_VERSION
 SALT_LEN = 16                    # GateConfig.h: SALT_LEN
 KDF_DKLEN = 32                   # GateConfig.h: KDF_DKLEN
-DEFAULT_KDF_ITER = 150000        # SPEC section 9 default; GateConfig.h: SUICIDE_KDF_ITER
+DEFAULT_KDF_ITER = 10000         # SPEC section 9: ~1s verify on classic ESP32 (150000 ~= 16.7s, measured)
 
 OTADATA_FILL_BYTE = 0xFF         # SPEC section 10: otadata_blank = all 0xFF -> first boot factory
 
@@ -644,11 +644,13 @@ def validate_args(args):
             "--max-att must be >= 1 (SPEC section 4.1: max_att is clamped >= 1, always; a value of "
             "0 would arm a wipe with zero failed attempts)"
         )
-    if args.kdf_iter < 50000:
+    if args.kdf_iter < 2000:
         # not fatal, but warn loudly to stderr (no password involved)
         sys.stderr.write(
-            "WARNING: --kdf-iter %d is low; SPEC section 9 recommends ~150000 "
-            "(tune so an on-device verify takes ~0.3-0.8 s).\n" % args.kdf_iter
+            "WARNING: --kdf-iter %d is very low. On a classic ESP32 ~10000 iters is about 1 s verify "
+            "(150000 measured ~16.7 s, too slow). With the 2-attempt wipe, online brute-force is moot; "
+            "offline-hash resistance comes from T2 flash-encryption + a strong passphrase, not "
+            "iteration count.\n" % args.kdf_iter
         )
     # Fail-safe arming pull/level pair (SPEC section 4.1). A NON-fail-safe combo idles the pin
     # TOWARD the armed level, so a cut/unplugged/floating wire reads ARMED and defeats the dead-man.
