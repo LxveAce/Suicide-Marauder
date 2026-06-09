@@ -1,0 +1,16 @@
+# host/requirements.txt -- Suicide Marauder host provisioner dependencies.
+#
+# provision.py itself uses only the Python 3.9+ standard library for everything security-relevant
+# (getpass, os.urandom, hashlib.pbkdf2_hmac, csv, json, argparse). argon2 is NOT used: OWASP's
+# Argon2id 19 MiB minimum is impossible on ESP32 RAM, so the device uses PBKDF2-HMAC-SHA256 and the
+# host must match it -- see docs/SPEC.md section 9.
+#
+# The ONE external dependency is the NVS partition image generator. It is NOT bundled with esptool
+# (confirmed), so install it here. provision.py guards the call: if it is missing, it prints an
+# actionable message instead of crashing. You may instead vendor nvs_partition_gen.py into
+# host/vendor/ (Apache-2.0) or point --nvs-gen-dir at a copy, in which case this dep is optional.
+esp-idf-nvs-partition-gen>=0.1.0
+
+# esptool is consumed by the flasher (flasher-integration / headless-marauder-gui), not by
+# provision.py directly. It is listed here for convenience when staging a full flash workflow.
+esptool>=4.6
