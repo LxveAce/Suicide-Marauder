@@ -21,7 +21,7 @@
 
 | | |
 |---|---|
-| **Maturity** | **Scaffold.** The interface contract ([`docs/SPEC.md`](docs/SPEC.md)) and headers are frozen; the implementation is being filled in against them. |
+| **Maturity** | **Implemented + SAFE_MODE hardware-validated.** The gate (password verify, 2-fail wipe, arming, NVS config, simulated wipe) was validated on a classic ESP32-D0WD in `SUICIDE_SAFE_MODE` with **zero real erases** — full log in [`docs/HARDWARE-TEST.md`](docs/HARDWARE-TEST.md). The interface contract ([`docs/SPEC.md`](docs/SPEC.md)) is frozen. |
 | **Brick primitive** | **UNVERIFIED.** The Stage-3 self-erase of the running app/boot-chain has not been proven on hardware — see [`docs/SPIKE-PLAN.md`](docs/SPIKE-PLAN.md). It is implemented but **guarded behind `SUICIDE_SAFE_MODE`**, and CI never produces a live-brick build. |
 | **Default tier** | **T1** (no Secure Boot / Flash Encryption — reflashable; data-wipe only). **T2** (Secure Boot v2 + Flash Encryption, true unrecoverable brick) is opt-in and **IRREVERSIBLE** at the eFuse level. |
 | **Default variant** | **FORK** (works on every flash size incl. 4 MB). **GUARDIAN** is documented + partition-templated for 8 MB+ (16 MB preferred). |
@@ -116,6 +116,7 @@ Suicide-Marauder/
 │   ├── THREAT-MODEL.md
 │   ├── RESEARCH-DIGEST.md         ← grounded detail + citations
 │   ├── SPIKE-PLAN.md              ← sacrificial-board plan for the UNVERIFIED brick
+│   ├── HARDWARE-TEST.md           ← SAFE_MODE validation log (classic ESP32)
 │   └── LICENSING.md               ← GPL/LGPL distribution notes
 ├── firmware/
 │   ├── bootgate/                  ← gate headers + impl
@@ -125,8 +126,9 @@ Suicide-Marauder/
 │   │   ├── SelfDestruct.h         ← best-effort secure erase (Stage-3 UNVERIFIED)
 │   │   └── GateCrypto.h           ← PBKDF2-HMAC-SHA256 verify
 │   ├── partitions/                ← suicide_4MB.csv / suicide_16MB.csv / guardian_16MB.csv
-│   └── integration/
-│       └── INTEGRATION.md         ← where to insert BootGate::run() in ESP32Marauder.ino
+│   ├── integration/
+│   │   └── INTEGRATION.md         ← where to insert BootGate::run() in ESP32Marauder.ino
+│   └── test_harness/              ← SAFE_MODE bench (validated on real hardware)
 ├── host/
 │   └── provision.py               ← builds guardcfg.bin + bundle.json (no plaintext ever logged)
 ├── scripts/
