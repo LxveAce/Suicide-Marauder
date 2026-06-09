@@ -425,8 +425,29 @@ def write_otadata_blank(out_path, size_bytes):
 # Bundle manifest assembly (SPEC section 10 -- the COMPLETE flash list the flasher consumes)
 # ----------------------------------------------------------------------------------------------
 
-def _manifest_entry(file_name, offset, partition=None, size=None):
-    """Build a single manifest `files[]` entry. offset is stored both as int and hex string."""
+def _sha256_file(path):
+    """Return the lowercase hex SHA-256 of a file's bytes (streamed, constant memory).
+
+    Defense-in-depth: the flasher recomputes this and ABORTS on mismatch, so a tampered bundle
+    .bin cannot be flashed. No password material is ever in these images (only the salted hash),
+    so hashing/logging the digest is safe.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _manifest_entry(file_name, offset, partition=None, size=None, out_dir=None):
+    """Build a single manifest `files[]` entry. offset is stored both as int and hex string.
+
+    When `out_dir` is given and `out_dir/file_name` exists, a "sha256" of the actual image bytes
+    is recorded so the flasher can verify integrity before flashing (defense-in-depth vs a
+    tampered bundle). If the artifact is not present yet (absent build artifact — a warning is
+    emitted elsewhere) the entry simply carries no "sha256"; the flasher treats a missing digest
+    as TOFU (warn-but-allow) for back-compat with older bundles.
+    """
     entry = {
         "file": file_name,
         "offset": offset,
@@ -436,6 +457,10 @@ def _manifest_entry(file_name, offset, partition=None, size=None):
         entry["partition"] = partition
     if size is not None:
         entry["size"] = size
+    if out_dir is not None:
+        src = os.path.join(out_dir, file_name)
+        if os.path.isfile(src):
+            entry["sha256"] = _sha256_file(src)
     return entry
 
 
@@ -516,17 +541,21 @@ def build_manifest_files(args, parts, guardcfg, otadata):
                 "bundle will be INCOMPLETE until you drop %r in next to bundle.json."
                 % (name, where, offset, name)
             )
-        files.append(_manifest_entry(name, offset, partition=partition))
+        # sha256 is recorded from the copied-in artifact when present; an absent artifact gets no
+        # digest (the flasher treats that as TOFU). Hashing happens against out_dir.
+        files.append(_manifest_entry(name, offset, partition=partition, out_dir=out_dir))
 
     # ---- guardcfg (minted here; offset/size READ from the partition CSV) ----
     files.append(_manifest_entry(
-        "guardcfg.bin", guardcfg["offset"], partition=GUARDCFG_PART, size=guardcfg["size"]
+        "guardcfg.bin", guardcfg["offset"], partition=GUARDCFG_PART, size=guardcfg["size"],
+        out_dir=out_dir,
     ))
 
     # ---- GUARDIAN otadata seed (minted here; offset/size READ from the CSV) ----
     if args.variant == "guardian":
         files.append(_manifest_entry(
-            otadata_seed, otadata_off, partition=OTADATA_PART, size=otadata["size"]
+            otadata_seed, otadata_off, partition=OTADATA_PART, size=otadata["size"],
+            out_dir=out_dir,
         ))
 
     # Sanity: exactly one image lands on the otadata offset (no collision -- SPEC section 10).

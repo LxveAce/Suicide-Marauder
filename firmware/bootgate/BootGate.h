@@ -30,7 +30,11 @@ class BootGate {
   static GateResult run();
 
  private:
-  static GateResult armedFlow(GateConfig& cfg);   // master-armed path (SPEC §6 steps 5-7)
+  // master-armed path (SPEC §6 steps 5-7). lowSupply=true on a brownout/undervoltage boot: the
+  // CORRECT password is still required to boot (no bypass), but destruction is SUPPRESSED — the
+  // dead-man pre-check is skipped and reaching max_att LOCKS/halts forever instead of wiping
+  // (reliability-first: a flaky rail must NEVER cause a wipe). SPEC §13.
+  static GateResult armedFlow(GateConfig& cfg, bool lowSupply);
   static void       backoff(uint32_t attempt);    // re-prompt pacing
 };
 

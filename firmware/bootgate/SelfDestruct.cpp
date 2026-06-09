@@ -353,43 +353,100 @@ bool SelfDestruct::wipeSD(const GateConfig& cfg) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Stage 2: internal data partitions. ota_0 / spiffs / nvs / coredump, then guardcfg LAST. The
-// caller (SelfDestruct::trigger) already has cfg copied into RAM, so erasing guardcfg here does
-// not pull the rug out from under the rest of the sequence.
+// Retry wrappers (red-team robustness, SPEC §8): a single esp_partition_erase_range can fail
+// transiently (bus contention, a marginal sector). Retry a failed partition a few times before
+// giving up so one flaky sector does not abort the whole wipe. In SAFE MODE the underlying erase is
+// a log-only no-op that returns true, so these loop exactly once.
+// ---------------------------------------------------------------------------------------------
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+
+namespace {
+constexpr int ERASE_RETRIES = 3;  // total attempts per partition (1 try + 2 retries)
+
+bool eraseDataPartitionRetry(esp_partition_subtype_t subtype, const char* label) {
+  for (int attempt = 1; attempt <= ERASE_RETRIES; ++attempt) {
+    if (eraseDataPartition(subtype, label)) {
+      return true;
+    }
+    ESP_LOGW(TAG, "erase data '%s' attempt %d/%d failed — retrying", label ? label : "?", attempt,
+             ERASE_RETRIES);
+  }
+  ESP_LOGE(TAG, "erase data '%s' FAILED after %d attempts", label ? label : "?", ERASE_RETRIES);
+  return false;
+}
+
+bool eraseAppPartitionRetry(esp_partition_subtype_t subtype, const char* what) {
+  for (int attempt = 1; attempt <= ERASE_RETRIES; ++attempt) {
+    if (eraseAppPartition(subtype, what)) {
+      return true;
+    }
+    ESP_LOGW(TAG, "erase app %s attempt %d/%d failed — retrying", what, attempt, ERASE_RETRIES);
+  }
+  ESP_LOGE(TAG, "erase app %s FAILED after %d attempts", what, ERASE_RETRIES);
+  return false;
+}
+}  // namespace
+
+#endif  // ESP32
+
+// ---------------------------------------------------------------------------------------------
+// Stage 2: internal partitions. Covers EVERY app+data partition (FORK 4 MB, FORK/GUARDIAN 16 MB,
+// T2 layouts) except the running app: app slots ota_0 AND ota_1 (a GUARDIAN/16 MB layout has a
+// second app slot a 4 MB FORK does not), spiffs, Marauder nvs, coredump, otadata (boot-selection
+// metadata), nvs_keys (the T2 NVS-encryption key partition — leaving it would let an attacker
+// decrypt a recovered NVS image), then guardcfg LAST. Each step is retried; the bool result is
+// captured so trigger() can know whether the wipe truly completed (red-team: never log "complete"
+// over a failed step).
 // ---------------------------------------------------------------------------------------------
 bool SelfDestruct::wipeInternal(const GateConfig& cfg) {
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
   bool ok = true;
 
-  // Marauder app slot (ota_0). Loss of this does not stop the running code (we are XIP from it on
-  // GUARDIAN-factory, or from ota_0 on FORK — in the FORK case the brick stage handles the running
-  // region; here we only erase the *other* app slot if it is not the running one).
+  const esp_partition_t* running = esp_ota_get_running_partition();
+
+  // App slots. Loss of a non-running slot does not stop the running code. The RUNNING app slot
+  // (FORK: typically ota_0) is NOT erased here — that is the brick stage's job; erasing it now would
+  // crash mid-sequence. We defer ONLY the running slot and still erase any other app slot.
   if (cfg.wipe_ota) {
-    const esp_partition_t* ota0 =
-        esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, nullptr);
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    if (ota0 && ota0 == running) {
-      // We are running from ota_0 (FORK). Do NOT erase it here — that is the brick stage's job,
-      // and doing it now would crash mid-sequence. Leave it for brickBootChain (if cfg.brick).
-      ESP_LOGW(TAG, "ota_0 is the running partition — deferring its erase to the brick stage");
-    } else {
-      ok &= eraseAppPartition(ESP_PARTITION_SUBTYPE_APP_OTA_0, "ota_0");
+    struct AppSlot { esp_partition_subtype_t subtype; const char* name; };
+    const AppSlot appSlots[] = {
+        {ESP_PARTITION_SUBTYPE_APP_OTA_0, "ota_0"},
+        {ESP_PARTITION_SUBTYPE_APP_OTA_1, "ota_1"},  // GUARDIAN/16 MB second app slot (absent on 4 MB)
+    };
+    for (const AppSlot& slot : appSlots) {
+      const esp_partition_t* p =
+          esp_partition_find_first(ESP_PARTITION_TYPE_APP, slot.subtype, nullptr);
+      if (p && running && p->address == running->address && p->size == running->size) {
+        ESP_LOGW(TAG, "%s is the running partition — deferring its erase to the brick stage",
+                 slot.name);
+        continue;  // do not crash mid-sequence; brickBootChain (if cfg.brick) handles it
+      }
+      ok &= eraseAppPartitionRetry(slot.subtype, slot.name);
     }
   }
 
   if (cfg.wipe_spiffs) {
-    ok &= eraseDataPartition(ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "spiffs");
+    ok &= eraseDataPartitionRetry(ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "spiffs");
   }
   if (cfg.wipe_nvs) {
     // Marauder's main NVS (label "nvs"). NOT guardcfg (also nvs-subtype) — that is erased last.
-    ok &= eraseDataPartition(ESP_PARTITION_SUBTYPE_DATA_NVS, "nvs");
+    ok &= eraseDataPartitionRetry(ESP_PARTITION_SUBTYPE_DATA_NVS, "nvs");
   }
 
   // Coredump always erased (may hold RAM snapshots / secrets).
-  ok &= eraseDataPartition(ESP_PARTITION_SUBTYPE_DATA_COREDUMP, "coredump");
+  ok &= eraseDataPartitionRetry(ESP_PARTITION_SUBTYPE_DATA_COREDUMP, "coredump");
+
+  // otadata: boot-selection metadata. Always erased so a recovered board cannot infer/boot a
+  // surviving slot (and on GUARDIAN this forces fallback to factory). Absent on a single-slot 4 MB
+  // FORK — eraseDataPartition treats "not present" as success.
+  ok &= eraseDataPartitionRetry(ESP_PARTITION_SUBTYPE_DATA_OTA, "otadata");
+
+  // nvs_keys: the T2 NVS-encryption key partition. MUST be erased — otherwise a dumped (encrypted)
+  // NVS image could be decrypted with the surviving keys. Absent on T1 builds (treated as success).
+  ok &= eraseDataPartitionRetry(ESP_PARTITION_SUBTYPE_DATA_NVS_KEYS, "nvs_keys");
 
   // guardcfg LAST of the data partitions. cfg is already in RAM, so this is safe.
-  ok &= eraseDataPartition(ESP_PARTITION_SUBTYPE_DATA_NVS, "guardcfg");
+  ok &= eraseDataPartitionRetry(ESP_PARTITION_SUBTYPE_DATA_NVS, "guardcfg");
 
   return ok;
 #else
@@ -517,11 +574,20 @@ void SelfDestruct::panicIndicate(TriggerReason reason) {
 
 // ---------------------------------------------------------------------------------------------
 // trigger — full sequence per cfg flags (SPEC §8). Non-abortable. Does not return on a real brick.
+//   0. set WIPE-IN-PROGRESS tombstone (sgate_rt.wipe_armed=1) BEFORE any erase, so an interrupted
+//      wipe RESUMES on the next boot instead of leaving residual data.
 //   1. wipeSD  -> 2. wipeInternal (guardcfg LAST)  -> 3. brickBootChain (if cfg.brick).
+//   4. clear the tombstone ONLY if every step verifiably succeeded.
+//
+// Red-team robustness (SPEC §8):
+//   (a) the tombstone is committed first (resume on power loss);
+//   (b) panicIndicate() runs AFTER the destructive work — do NOT telegraph to an attacker before
+//       erasing (the LED blink / serial banner is the LAST thing, not the first);
+//   (d) wipeSD()/wipeInternal() bool results are captured; a failed step means we NEVER log
+//       "self-destruct complete" and NEVER clear the tombstone — so the next boot retries.
 // ---------------------------------------------------------------------------------------------
 void SelfDestruct::trigger(const GateConfig& cfg, TriggerReason reason) {
   // cfg is already in RAM (passed by const ref from BootGate); safe to erase guardcfg later.
-  panicIndicate(reason);
 
 #if defined(SUICIDE_SAFE_MODE) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM))
   // SAFE-mode entry gate (SPEC §3): a simulated destruct REQUIRES a real, dedicated scratch
@@ -537,25 +603,79 @@ void SelfDestruct::trigger(const GateConfig& cfg, TriggerReason reason) {
   ESP_LOGW(TAG, "[SAFE] scratch partition present — proceeding with LOG-ONLY simulation");
 #endif
 
-  // Stage 1: SD (best-effort, FTL-limited; documented).
-  wipeSD(cfg);
+  // Stage 0 (red-team (a)): set the WIPE-IN-PROGRESS tombstone and COMMIT it to NVS BEFORE touching
+  // anything. If power is lost mid-erase, GateConfig::load() sees sgate_rt.wipe_armed=1 on the next
+  // boot and BootGate::run() RE-TRIGGERS this sequence to finish. Under SUICIDE_SAFE_MODE this is a
+  // log-only no-op (no real NVS write — a dry run must never arm a real resume). We deliberately do
+  // NOT abort if the tombstone write fails: failing to persist it must not stop the wipe (the worst
+  // case is no auto-resume, never a skipped wipe).
+  GateRuntime rt = GateRuntime::load();
+  if (!rt.setWipeTombstone()) {
+    ESP_LOGE(TAG, "could not persist wipe tombstone (sgate_rt.wipe_armed) — proceeding anyway; "
+                  "auto-resume-on-interrupt may be unavailable");
+  }
 
-  // Stage 2: internal data partitions, guardcfg LAST.
-  wipeInternal(cfg);
+  // Stage 1: SD (best-effort, FTL-limited; documented). Capture the result.
+  bool ok = true;
+  ok &= wipeSD(cfg);
 
-  // Stage 3: brick the boot chain only if configured (T1 default 0; T2 default 1).
+  // Stage 2: internal data partitions, guardcfg LAST. Capture the result.
+  ok &= wipeInternal(cfg);
+
+  // Red-team (b): panicIndicate() runs HERE — after the destructive work — so we never telegraph an
+  // imminent wipe to an attacker before the data is gone. On a brick build the device is already
+  // erased by now; on T1 it is data-wiped. (On a real brick with cfg.brick we still signal first,
+  // because brickBootChain never returns.)
+  panicIndicate(reason);
+
+  // Stage 3: brick the boot chain only if configured (T1 default 0; T2 default 1). A real brick does
+  // not return, so the tombstone-clear/halt below is reached only on T1 or SAFE builds. If earlier
+  // stages failed we still proceed to brick (defense-in-depth: a configured brick should still run),
+  // but we do NOT clear the tombstone unless everything succeeded.
   if (cfg.brick) {
+    if (!ok) {
+      ESP_LOGE(TAG, "one or more wipe steps FAILED before brick — tombstone left SET so a "
+                    "non-bricked retry can finish; proceeding to brick");
+    }
     brickBootChain(cfg);  // noreturn on a real brick
     // (SAFE-mode brickBootChain spins; real brick never returns.)
   }
 
+  if (ok) {
+    // Red-team (a): a wipe verifiably completed — the tombstone must be GONE so a later clean
+    // reflash is not perpetually re-wiped. In the REAL path wipeInternal already erased the
+    // guardcfg partition (which physically holds the sgate_rt tombstone) as its LAST step, so the
+    // tombstone is already cleared — re-writing wipe_armed=0 here would RE-CREATE guardcfg and leave
+    // a residual artifact, so we MUST NOT. Under SUICIDE_SAFE_MODE nothing was really erased, so we
+    // call the (no-op) clear for symmetry/logging only.
 #if defined(SUICIDE_SAFE_MODE)
-  ESP_LOGW(TAG, "[SAFE] self-destruct simulation complete (brick=%u) — device still alive",
-           (unsigned)cfg.brick);
+    rt.clearWipeTombstone();  // log-only no-op (no real NVS write)
 #else
-  // T1 (brick=0): data is wiped but the board is still reflashable. Halt — the gate's job is done
-  // and we must not fall through into Marauder with a half-erased filesystem.
-  ESP_LOGW(TAG, "self-destruct complete (brick=0); halting");
+    ESP_LOGW(TAG, "wipe complete — tombstone cleared implicitly by the guardcfg erase");
+#endif
+  }
+
+#if defined(SUICIDE_SAFE_MODE)
+  if (ok) {
+    ESP_LOGW(TAG, "[SAFE] self-destruct simulation complete (brick=%u) — device still alive",
+             (unsigned)cfg.brick);
+  } else {
+    // Red-team (d): never claim completion when a step failed.
+    ESP_LOGE(TAG, "[SAFE] self-destruct simulation had FAILED step(s) (brick=%u) — tombstone left "
+                  "SET; NOT logging complete", (unsigned)cfg.brick);
+  }
+#else
+  if (ok) {
+    // T1 (brick=0): data is wiped but the board is still reflashable. Halt — the gate's job is done
+    // and we must not fall through into Marauder with a half-erased filesystem.
+    ESP_LOGW(TAG, "self-destruct complete (brick=0); halting");
+  } else {
+    // Red-team (d): a step failed. Do NOT log "complete". The tombstone is still SET, so the next
+    // boot re-triggers and retries. Halt either way — never fall through into Marauder over partly
+    // erased data.
+    ESP_LOGE(TAG, "self-destruct INCOMPLETE (brick=0); one or more steps failed — tombstone left "
+                  "SET for retry on next boot; halting");
+  }
   for (;;) {
     delay(1000);
   }

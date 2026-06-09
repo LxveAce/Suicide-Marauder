@@ -43,6 +43,14 @@ static constexpr uint8_t  CFG_VERSION = 1;
 struct GateConfig {
   bool     provisioned = false;          // true iff a pwhash exists in NVS
 
+  // SPEC §8 robustness (red-team): set true iff the `sgate_rt` wipe-in-progress TOMBSTONE
+  // (`wipe_armed == 1`) is present. An interrupted self-destruct (power loss mid-erase) leaves the
+  // tombstone set; BootGate::run() MUST re-trigger SelfDestruct on the next boot to FINISH the wipe
+  // rather than report a clean (deprovisioned-but-data-present) PASS. This is independent of
+  // `provisioned`: a partly-erased guardcfg may read as unprovisioned, but the tombstone still
+  // forces resume.
+  bool     resumeWipe = false;
+
   uint8_t  salt[SALT_LEN]   = {0};
   uint8_t  pwhash[KDF_DKLEN] = {0};
   uint32_t kdf_iter = SUICIDE_KDF_ITER;
@@ -67,10 +75,22 @@ struct GateConfig {
 struct GateRuntime {
   uint8_t  att_ct = 0;
   uint32_t lock_until = 0;               // exponential backoff gate (disarmed mode)
+  uint8_t  wipe_armed = 0;               // SPEC §8: wipe-in-progress TOMBSTONE (1 once a real
+                                         // self-destruct has started; cleared only on verified
+                                         // completion). Survives power loss => resume an interrupted
+                                         // wipe on the next boot.
 
   static GateRuntime load();
   void commitAttempts();                 // persist att_ct BEFORE responding to a wrong attempt
   void reset();                          // att_ct=0 on a correct password
+
+  // SPEC §8 robustness (red-team): persistent wipe-in-progress tombstone in `sgate_rt`.
+  // setWipeTombstone() writes wipe_armed=1 and COMMITS it BEFORE any erase begins; clearWipe-
+  // Tombstone() removes it only after a wipe verifiably completes. Under SUICIDE_SAFE_MODE both are
+  // LOG-ONLY no-ops (zero real NVS writes) so a dry run can never arm a real resume-on-next-boot.
+  // Returns true iff the (real) NVS write+commit succeeded. SAFE-mode no-ops return true.
+  bool setWipeTombstone();
+  bool clearWipeTombstone();
 };
 
 } // namespace suicide

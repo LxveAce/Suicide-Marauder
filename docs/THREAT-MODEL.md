@@ -22,9 +22,9 @@ your own device, for confidentiality, within the law that applies to you.
 | # | Adversary | Capability | What we do about it |
 |---|-----------|-----------|---------------------|
 | A1 | Casual finder / thief | Powers it on, pokes the UI | Boot password gate; wrong attempts → lock/backoff (disarmed) or wipe (armed). |
-| A2 | Opportunist with a laptop | Tries to read/flash over USB | T2: Flash Encryption makes a dump meaningless; Secure Boot + disabled UART download stop reflash-past-gate. T1: **not** protected — documented. |
+| A2 | Opportunist with a laptop | Tries to read/flash over USB | T2: Flash Encryption makes a dump meaningless; Secure Boot + disabled UART download stop reflash-past-gate. T1: **not** protected — selective `guardcfg` erase, `armed=0`/`cfg_ver`/`att_ct`/`kdf_iter` NVS tamper, otadata rewrite, or a full reflash (incl. via this project's own flasher) all bypass the gate; enumerated in "Residual risks" below. |
 | A3 | Tamper / snatch | Opens the case or yanks the device | Dead-man arming line (armed): case-open/cut/**disconnect** reads NOT-ARMED → wipe. Best-effort given power-loss timing. **Limit:** the single-ended line detects open/cut/disconnect, **not** an attacker who *clamps* the pin to the armed level (see "stuck-at" note below). |
-| A4 | Coercion ("unlock it") | Demands the password | Duress: entering a wrong password the configured number of times wipes instead of unlocking. (Owner's choice; understand local law on compelled passwords.) |
+| A4 | Coercion ("unlock it") | Demands the password | Duress: entering a wrong password the configured number of times wipes instead of unlocking. (Owner's choice; understand local law on compelled passwords.) Note: a *recovered* real password also enables the authenticated serial **host-wipe** (a force-wipe DoS), not only unlock — see "Residual risks." |
 | A5 | Forensics lab | Chip-off, JTAG, FTL spare-area recovery | T2 (encryption) is the only real defense. SD remanence and a *removed* SD card are out of scope. Honestly documented as a limit. |
 
 ## Trust boundaries
@@ -46,14 +46,88 @@ The design deliberately biases away from accidental destruction:
   before any trigger is even evaluated.
 - **Correct password always wins** and never wipes, regardless of the arming line (except the
   dead-man pre-check, which is a hard hardware gate the owner explicitly enabled).
-- **Undervoltage boot ⇒ treated as DISARMED** so a brownout cannot spuriously trip the line.
+- **Undervoltage boot ⇒ treated as DISARMED** so a brownout cannot spuriously trip the *destruct*
+  path (a flaky rail must never fire an irreversible erase or read the arming line). **It does NOT
+  open the device:** the password is still required to boot (see "Brownout weaponization" below). A
+  brownout boot only suppresses the wipe-capable armed flow, never the gate itself.
 - The one fail-*toward*-destruction behavior — a cut arming wire wiping an **armed** board — is the
   dead-man feature itself, is opt-out (`deadman=0`), and is loudly documented.
 
 ## Residual risks (accepted / documented, not solved)
 
-- T1 builds are bypassable by a capable attacker (reflash/chip-pull). Use T2 for real assurance.
+- **T1 builds are bypassable by a capable attacker — and the disarm is cheaper than a chip-pull.**
+  "T1 reflashable" is not just "reflash the whole app"; because T1 has **no Secure Boot / Flash
+  Encryption**, an attacker with USB/JTAG access can read and rewrite `guardcfg` NVS and the boot
+  chain directly. The specific T1 disarm primitives we have identified (several **CONFIRMED on
+  hardware**) are:
+  - **Selective `guardcfg` erase — CONFIRMED on hardware.** Erasing *only* the `guardcfg` partition
+    (e.g. `esptool erase_region <guardcfg off> <size>`, offset readable from the partition table at
+    0x8000) drops the board to **unprovisioned** → `BootGate::run()` returns `GATE_PASS` and the
+    board boots plain Marauder **with all captured data intact**. The fail-safe "unprovisioned never
+    wipes" invariant is exactly what the attacker exploits: wiping the *gate config* is not wiping
+    the *data*. This is the cheapest full bypass and needs no reflash of the app at all.
+  - **`armed=0` downgrade.** Rewriting the single `armed` byte in `guardcfg` NVS to 0 → master
+    DISARMED → boot proceeds, destruct physically impossible. (Provisioned + disarmed still requires
+    nothing to read the data, since disarmed only suppresses *wiping*, not reading.)
+  - **`cfg_ver` corruption.** Setting `cfg_ver` to any value the firmware does not recognize trips
+    the fail-safe "unknown schema ⇒ NOT provisioned" path (§4.1) → `GATE_PASS`, data intact. Same
+    "fail-safe is the bypass" shape as the selective erase.
+  - **`att_ct` reset.** Rewriting `sgate_rt.att_ct` back to 0 between guesses defeats the
+    monotonic/power-cycle-safe counter, restoring effectively unlimited offline guessing against the
+    (dumpable) hash.
+  - **`kdf_iter` downgrade.** Lowering `kdf_iter` in NVS (then re-deriving) cheapens an online
+    re-guess; combined with the dumpable hash this only matters alongside a weak passphrase, but it
+    is one more T1 NVS-tamper primitive.
+
+  All of the above are **write/erase attacks on plaintext T1 NVS + flash**. **T2 (Secure Boot v2 +
+  Flash Encryption) is the real mitigation:** it makes `guardcfg` unreadable/unwritable off-device,
+  authenticates the boot chain so a tampered NVS/app will not boot, and is the only tier that turns
+  these from "trivial" into "infeasible".
+- **The project's own flasher is a turnkey reflash-past-gate on T1.** `headless-marauder-gui`'s
+  `flash_suicide()` / app-mode `flash()` (`marauder_core/flasher.py`) will, on a **T1** board,
+  cheerfully write a fresh bootloader + partitions + app + a benign/attacker-chosen `guardcfg.bin`
+  over the top — i.e. it is a ready-made tool to reflash *past* the gate (or to drop a new
+  unprovisioned/disarmed config). This is inherent to T1 (no Secure Boot to reject the image), not a
+  flaw in the flasher; it is called out so nobody assumes "you'd need custom tooling." On **T2** the
+  same flasher cannot reflash past the gate (Secure Boot rejects the unsigned image / Flash
+  Encryption garbles it). Separately, suicide **bundles** were originally **trust-on-first-build**
+  (the flasher wrote whatever `.bin`s were in the bundle dir with no integrity check); the flasher
+  **now recomputes each image's SHA-256 and enforces it against the manifest** (`_sha256_file` +
+  the per-entry `sha256` check in `flash_suicide`), aborting on mismatch. Back-compat: an entry with
+  **no** `sha256` is still flashed but **warned** (TOFU) — older bundles predate the field; regenerate
+  the bundle so every entry carries a `sha256` to get enforcement.
+- **A recovered/cracked password is not just an unlock — it is also a force-wipe.** On a headless
+  (`GATE_INPUT_SERIAL`) **armed** build the authenticated serial host-wipe (`wipe` → password →
+  `REASON_HOST_WIPE`) triggers `SelfDestruct` on a **correct** password. So an attacker who recovers
+  the passphrase (offline crack of a dumped T1 hash, shoulder-surf, coercion) can both **unlock** and
+  **deliberately destroy** the data over USB — a **force-wipe DoS** against the owner, not only a
+  confidentiality break. This is by design (the owner wanted a panic-wipe), but it widens the impact
+  of any password compromise. T2 (hash not dumpable) plus a strong passphrase is the mitigation;
+  there is no separate wipe-only vs unlock-only credential.
 - SD overwrite cannot guarantee destruction of FTL-remapped cells; encryption-at-rest is the fix.
+  (The stock-SD path is also **file + free-space overwrite only — no guaranteed format/secure-erase**;
+  see SPEC §8.)
+- **Brownout weaponization (CONFIRMED, on hardware).** The "undervoltage boot ⇒ treat as DISARMED"
+  reliability rule was a fail-safe (don't fire an irreversible erase on a sagging rail). **Risk (as
+  originally written):** a forced brownout boot — an attacker deliberately under-volting the rail at
+  power-on — took the disarmed branch and returned `GATE_PASS` **before the password was ever
+  requested**, i.e. a brownout was a free gate bypass on any board (armed or not). **Fix:** the
+  undervoltage path now still **requires a correct password to boot** — it only suppresses the
+  *destruct-capable* armed flow (no arming-line read, no wipe on a flaky rail), it does **not** skip
+  the gate. A brownout can therefore at most degrade an armed board to "locked, password still
+  required," never to "open." (T2 additionally prevents the attacker from reflashing around the gate
+  if they give up on the brownout route.)
+- **GUARDIAN otadata-rewrite "skip the Guardian" bypass.** In the GUARDIAN variant the gate is the
+  **factory** app and boots Marauder in `ota_0` only after passing. On **T1**, an attacker can simply
+  rewrite **`otadata`** (set the boot partition to `ota_0`, or write a normal `boot_app0`-style seed
+  at the otadata offset) so the bootloader boots the **unmodified Marauder in `ota_0` directly,
+  skipping the Guardian gate entirely** — the data in `ota_0`/spiffs is then served with no password.
+  This is the same plaintext-flash-tamper class as the `guardcfg` primitives above. Mitigations:
+  **T2** (Secure Boot authenticates the boot selection / Flash Encryption protects it) is the real
+  fix; defense-in-depth `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` + having Marauder never mark itself
+  valid causes a fall-back to the Guardian factory app, but on T1 a determined attacker who controls
+  `otadata` can still force the `ota_0` boot. Treat GUARDIAN-on-T1 as defense-in-depth only, not a
+  boundary.
 - A device snatched **while powered and mid-wipe** may not finish the bulk erase (no instant
   crypto-erase on ESP32).
 - **Dead-man "stuck-at-armed" defeat (A3).** The arming line is **single-ended**, so it can only

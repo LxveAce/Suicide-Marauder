@@ -32,9 +32,17 @@ Five headers + their `.cpp` implementations live in [`../bootgate/`](../bootgate
 
 The integration is **two edits to one file** plus build configuration:
 
-1. `#include "bootgate/BootGate.h"` near Marauder's other includes.
-2. A single `suicide::BootGate::run()` call inserted **after** `display_obj.RunSetup()` and
-   **before** `settings_obj.begin()` (SPEC §1, §6).
+1. `#include "esp_system.h"` (for `esp_restart`) and `#include "bootgate/BootGate.h"` near
+   Marauder's other includes.
+2. A single **fail-closed** gate call inserted **after** `display_obj.RunSetup()` and **before**
+   `settings_obj.begin()` (SPEC §1, §6):
+
+   ```cpp
+   if (suicide::BootGate::run() != suicide::GATE_PASS) { esp_restart(); }
+   ```
+
+   The return value is **checked**, not discarded: only `GATE_PASS` is allowed to continue into
+   Marauder. Any other result reboots (see §2 for why this matters).
 
 Everything else is build flags, a partition CSV, and a flashed `guardcfg` image. The exact patch
 is in [`esp32marauder.ino.patch`](esp32marauder.ino.patch); the PlatformIO env templates are in
@@ -102,7 +110,8 @@ code instead.
 #include "lang_var.h"
 ```
 
-Add `#include "bootgate/BootGate.h"` immediately after `#include "lang_var.h"`.
+Add both `#include "esp_system.h"` (for `esp_restart()`, used by the fail-closed hook) and
+`#include "bootgate/BootGate.h"` immediately after `#include "lang_var.h"`.
 
 **Call anchor.** Inside `void setup()`, the display comes up here (guarded by `HAS_SCREEN`):
 
@@ -129,11 +138,25 @@ SPIFFS, or SD work. This matches SPEC §1 ("after `display_obj.RunSetup()`, befo
 ```cpp
   // === Suicide Marauder boot-gate (FORK). Owner-only defensive duress layer. SPEC §1, §6. ===
   // Unprovisioned OR master-disarmed -> GATE_PASS (behaves like plain Marauder, cannot wipe).
-  suicide::BootGate::run();
+  // FAIL-CLOSED: only GATE_PASS continues into Marauder; anything else reboots.
+  if (suicide::BootGate::run() != suicide::GATE_PASS) { esp_restart(); }
   // A real (non-SAFE) trigger never returns. In SUICIDE_SAFE_MODE it logs and returns GATE_PASS.
 
   settings_obj.begin();
 ```
+
+**Why the result is checked, not discarded (fail-closed).** Calling `suicide::BootGate::run();` and
+throwing away the return value means the *only* thing that can stop a boot is a SelfDestruct that
+**never returns**. But self-destruct is best-effort (SPEC §8): with `brick=0` (T1) the wipe returns,
+a partial/failed erase returns, and any future code path that returns `GATE_TRIGGERED` instead of
+looping forever would silently fall through into the **un-gated** Marauder UI — exactly the bypass we
+are closing. Checking `!= suicide::GATE_PASS` and calling `esp_restart()` makes the hook fail
+*toward* not-booting: only an explicit `GATE_PASS` (unprovisioned, master-disarmed, or correct
+password) is allowed past. `esp_restart()` re-enters `setup()`, so the gate re-evaluates from a clean
+state on the next pass (e.g. `att_ct` already at `max_att` ⇒ it triggers again), rather than handing
+control to Marauder. This preserves every safe-default invariant — unprovisioned, master-disarmed,
+and correct-password all return `GATE_PASS` and boot normally; SAFE_MODE still returns `GATE_PASS`
+and performs zero real erases.
 
 Why here and not the very first line of `setup()`:
 - The display/backlight must be initialized for the touch / mini-kb / Cardputer adapters to render
@@ -266,6 +289,40 @@ primitive (SPEC §8, §13) — it is implemented behind `SUICIDE_SAFE_MODE` and 
 `CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED=y`. Enabling eFuse Secure Boot/FE is **IRREVERSIBLE**.
 Do this only after the spike succeeds on a sacrificial board. Optionally enable NVS encryption with
 an `nvs_keys` partition if `arm_pin`/`arm_level` must be hidden too (SPEC §4).
+
+> **Flash Encryption alone is NOT T2 — UART download mode must be disabled too.** Flash Encryption
+> protects data *at rest*, but if the **UART download (ROM serial) bootloader is still enabled**, an
+> attacker with the board can simply re-flash the gate away (or, on hardware that supports it, read
+> back plaintext via the download stub). A board with Flash Encryption but a live download mode is
+> **still reflashable past the gate** — that is at most T1-plus, not T2. A real T2 posture also burns
+> the download-disable eFuse — on classic ESP32 `DISABLE_DL_ENCRYPT` / `DISABLE_DL_DECRYPT` /
+> `DISABLE_DL_CACHE` (and, where supported, `UART_DOWNLOAD_DIS`); on S3/C3 `DIS_DOWNLOAD_MODE` (plus
+> `DIS_DIRECT_BOOT` / `DIS_USB_JTAG` as applicable). FE+SB in *release* mode normally sets these, but
+> a **Development**-mode FE flash does **not**, so this must be verified, not assumed.
+>
+> **A T2 claim MUST read back eFuses and refuse to declare a board hardened otherwise.** Run
+> `espefuse.py --port <PORT> summary` (or `idf.py efuse-summary`) and confirm, at minimum, that
+> `FLASH_CRYPT_CNT`/`SPI_BOOT_CRYPT_CNT` is burned (FE enabled, in *release* not development mode),
+> `ABS_DONE_*` / `SECURE_BOOT_EN` is set (Secure Boot v2 enabled), and the UART-download-disable
+> eFuse above is burned. Do **not** mark a board "T2 / hardened" on the basis of a build flag or an
+> `idf.py` log line — those describe *intent*, not the burned state. Only the read-back eFuse summary
+> proves the gate is no longer reflashable. The flasher's T2 path (SPEC §11) should surface this
+> read-back and block the "hardened" label until the summary confirms it.
+
+> **GUARDIAN variant — `otadata`-rewrite bypass.** In the GUARDIAN flow (§10) the gate is the
+> `factory` app and Marauder lives in `ota_0`. Boot selection is driven by the `otadata` partition.
+> Without Secure Boot, an attacker who can write flash (UART download, or even Marauder's own SD-OTA
+> path — see the §10/SPEC §1 collision) can **write `otadata` to point boot at `ota_0` directly and
+> SKIP the factory Guardian entirely** — the gate never runs, no password is ever asked, and nothing
+> wipes. Flash Encryption does not stop this on its own (the attacker is rewriting the boot selector,
+> not reading secrets). Closing it requires **(a) Secure Boot v2** so a re-flashed/forged image and
+> bootloader are rejected, **and (b) a correct rollback / anti-skip posture**:
+> `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` so an `ota_0` Marauder that never marks itself valid
+> auto-reverts to the Guardian, and `CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK` (with a monotonic
+> `secure_version`) so a forced downgrade/skip is rejected by the bootloader. The Guardian must also
+> re-assert `factory` (erase `otadata` or `esp_ota_set_boot_partition(factory)`) on its own boot so a
+> stale `ota_0` selection does not persist. Until Secure Boot + this rollback posture is enforced, a
+> GUARDIAN board is **not** T2 regardless of Flash Encryption.
 
 ---
 

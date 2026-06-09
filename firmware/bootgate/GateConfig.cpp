@@ -18,9 +18,15 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+#include "esp_log.h"
+#endif
+
 namespace suicide {
 
 namespace {
+
+[[maybe_unused]] constexpr const char* TAG = "gatecfg";  // used by SAFE-mode tombstone logging
 
 // Canonical guardcfg partition name (SPEC §3). The gate's NVS lives ONLY here.
 constexpr const char* GUARDCFG_PART = "guardcfg";
@@ -58,6 +64,16 @@ void getU32(nvs_handle_t h, const char* key, uint32_t* dst) {
   if (nvs_get_u32(h, key, &v) == ESP_OK) {
     *dst = v;
   }
+}
+
+// Open the runtime namespace (read/write). Mirrors the config-partition fallback logic. Declared
+// here (ahead of GateConfig::load) so load() can peek the wipe tombstone in `sgate_rt`.
+esp_err_t openRuntime(nvs_open_mode_t mode, nvs_handle_t* h) {
+  esp_err_t err = nvs_open_from_partition("guardcfg", NVS_NS_RT, mode, h);
+  if (err != ESP_OK) {
+    err = nvs_open(NVS_NS_RT, mode, h);
+  }
+  return err;
 }
 
 // Helper: read a fixed-size blob into dst, returning true iff the stored blob is exactly `len`
@@ -152,25 +168,28 @@ GateConfig GateConfig::load() {
     memset(cfg.pwhash, 0, KDF_DKLEN);
   }
 
+  // ---- wipe-in-progress TOMBSTONE (SPEC §8 robustness, red-team) ----
+  // Peek `sgate_rt.wipe_armed`. If a previous self-destruct started and was interrupted (power loss
+  // mid-erase), the tombstone is still set. We surface it as cfg.resumeWipe so BootGate::run() can
+  // RE-TRIGGER SelfDestruct on this boot and FINISH the wipe — never report a clean PASS over a
+  // partially-erased board. This is read regardless of provisioned-ness (a half-erased guardcfg may
+  // read unprovisioned, yet the wipe must still complete).
+  {
+    nvs_handle_t rh;
+    if (openRuntime(NVS_READONLY, &rh) == ESP_OK) {
+      uint8_t wipeArmed = 0;
+      getU8(rh, "wipe_armed", &wipeArmed);
+      nvs_close(rh);
+      cfg.resumeWipe = (wipeArmed != 0);
+    }
+  }
+
   return cfg;
 }
 
 // ---------------------------------------------------------------------------
 // GateRuntime — monotonic wrong-attempt counter in `sgate_rt`.
 // ---------------------------------------------------------------------------
-
-namespace {
-
-// Open the runtime namespace (read/write). Mirrors the config-partition fallback logic.
-esp_err_t openRuntime(nvs_open_mode_t mode, nvs_handle_t* h) {
-  esp_err_t err = nvs_open_from_partition("guardcfg", NVS_NS_RT, mode, h);
-  if (err != ESP_OK) {
-    err = nvs_open(NVS_NS_RT, mode, h);
-  }
-  return err;
-}
-
-}  // namespace
 
 GateRuntime GateRuntime::load() {
   GateRuntime rt;  // att_ct=0, lock_until=0 by default
@@ -185,6 +204,7 @@ GateRuntime GateRuntime::load() {
 
   getU8(h, "att_ct", &rt.att_ct);
   getU32(h, "lock_until", &rt.lock_until);
+  getU8(h, "wipe_armed", &rt.wipe_armed);  // SPEC §8 tombstone (reflect flash state in the struct)
 
   nvs_close(h);
   return rt;
@@ -226,6 +246,53 @@ void GateRuntime::reset() {
   nvs_set_u32(h, "lock_until", 0);
   nvs_commit(h);
   nvs_close(h);
+}
+
+// ---------------------------------------------------------------------------
+// Wipe-in-progress TOMBSTONE (SPEC §8 robustness, red-team).
+//
+// Persisted in `sgate_rt` (key `wipe_armed`) so an interrupted wipe (power loss mid-erase) resumes
+// on the next boot instead of leaving a deprovisioned-but-data-present board. setWipeTombstone()
+// MUST be called and COMMITTED before any erase begins; clearWipeTombstone() only after a wipe
+// verifiably completes. Under SUICIDE_SAFE_MODE both are LOG-ONLY no-ops — a dry run must NEVER
+// write a real tombstone (that could arm a real resume-wipe on a later non-SAFE boot).
+// ---------------------------------------------------------------------------
+bool GateRuntime::setWipeTombstone() {
+  wipe_armed = 1;
+#if defined(SUICIDE_SAFE_MODE)
+  ESP_LOGW(TAG, "[SAFE] would SET wipe tombstone (sgate_rt.wipe_armed=1) — NO-OP (no NVS write)");
+  return true;
+#else
+  ensureNvsReady();
+
+  nvs_handle_t h;
+  if (openRuntime(NVS_READWRITE, &h) != ESP_OK) {
+    return false;
+  }
+  esp_err_t e1 = nvs_set_u8(h, "wipe_armed", 1);
+  esp_err_t e2 = nvs_commit(h);  // commit NOW — the tombstone must be on flash before any erase
+  nvs_close(h);
+  return e1 == ESP_OK && e2 == ESP_OK;
+#endif
+}
+
+bool GateRuntime::clearWipeTombstone() {
+  wipe_armed = 0;
+#if defined(SUICIDE_SAFE_MODE)
+  ESP_LOGW(TAG, "[SAFE] would CLEAR wipe tombstone (sgate_rt.wipe_armed=0) — NO-OP (no NVS write)");
+  return true;
+#else
+  ensureNvsReady();
+
+  nvs_handle_t h;
+  if (openRuntime(NVS_READWRITE, &h) != ESP_OK) {
+    return false;
+  }
+  esp_err_t e1 = nvs_set_u8(h, "wipe_armed", 0);
+  esp_err_t e2 = nvs_commit(h);
+  nvs_close(h);
+  return e1 == ESP_OK && e2 == ESP_OK;
+#endif
 }
 
 }  // namespace suicide

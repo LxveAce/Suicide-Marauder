@@ -14,7 +14,12 @@
 //     The attempt counter is committed to NVS BEFORE responding, so a power-cycle mid-attempt
 //     cannot reset it.
 //   * Explicit host `wipe` over serial -> SelfDestruct(REASON_HOST_WIPE).
-//   * Undervoltage / low-battery boot -> treated as DISARMED (reliability-first, SPEC §13).
+//   * Undervoltage / low-battery boot (ARMED) -> destruct SUPPRESSED but the correct password is
+//     STILL required to boot (NO bypass): the dead-man pre-check is skipped and reaching max_att
+//     LOCKS/re-prompts forever instead of wiping. A brownout must NEVER cause a wipe (reliability-
+//     first, SPEC §13) and must NEVER hand out an unlocked board.
+//   * Wipe-in-progress tombstone (sgate_rt.wipe_armed) -> RESUME the interrupted self-destruct on
+//     the next boot (an interrupted wipe must finish, SPEC §8) — never a clean PASS over residual data.
 //
 // The plaintext password buffer returned by suicide::Input::getPassword() is zeroized after every
 // verify() — never stored, never logged.
@@ -99,19 +104,33 @@ void BootGate::backoff(uint32_t attempt) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// armedFlow — SPEC §6 steps 5-7. Only reached when cfg.provisioned && cfg.armed == 1 and the
-// supply is trusted. Returns GATE_PASS on a correct password; otherwise drives SelfDestruct.
+// armedFlow — SPEC §6 steps 5-7. Reached when cfg.provisioned && cfg.armed == 1.
+//
+// lowSupply (SPEC §13, brownout-bypass fix): when the supply is questionable (brownout/undervoltage
+// boot) destruction is SUPPRESSED but the gate is NOT bypassed. The CORRECT password is STILL
+// required to boot — a low rail must never hand an attacker an unlocked board. But because a flaky
+// rail must NEVER cause an irreversible wipe (reliability-first), on a low-supply boot we:
+//   * SKIP the dead-man pre-check entirely (the ADC/arming-line read is untrustworthy at low V, and
+//     a missing switch must not fire the irreversible path on a sagging rail), and
+//   * on reaching max_att, LOCK/HALT forever (re-prompt loop, never SelfDestruct) instead of wiping.
+// Returns GATE_PASS only on a correct password; otherwise drives SelfDestruct (trusted supply) or
+// locks forever (low supply).
 // ---------------------------------------------------------------------------------------------
-GateResult BootGate::armedFlow(GateConfig& cfg) {
+GateResult BootGate::armedFlow(GateConfig& cfg, bool lowSupply) {
   // Step 6: dead-man pre-check. In dead-man mode a cut/floating/unpowered arming wire reads
   // NOT_ARMED and is terminal BEFORE we ever ask for a password.
-  if (cfg.deadman == 1) {
+  // SUPPRESSED on a low-supply boot: do not read the arming line and do not allow a deadman wipe —
+  // a brownout must never fire the irreversible path (SPEC §13). The password is still required.
+  if (cfg.deadman == 1 && !lowSupply) {
     ArmState line = ArmingSwitch::read(cfg);
     if (line == NOT_ARMED) {
       ESP_LOGW(TAG, "ARMED + deadman: arming line NOT in armed position -> REASON_DEADMAN");
       SelfDestruct::trigger(cfg, REASON_DEADMAN);
       return GATE_TRIGGERED;  // does not return in practice (real, non-SAFE brick)
     }
+  } else if (cfg.deadman == 1 && lowSupply) {
+    ESP_LOGW(TAG, "low-supply boot: SKIPPING dead-man pre-check (suppress destruct; password still "
+                  "required) — reliability-first (SPEC §13)");
   }
 
   // Step 7: password loop. The runtime counter is monotonic and power-cycle-safe.
@@ -143,11 +162,18 @@ GateResult BootGate::armedFlow(GateConfig& cfg) {
     in.len = 0;
 
     if (ok) {
-      if (isWipeRequest) {
+      if (isWipeRequest && !lowSupply) {
         // Authenticated, deliberate panic-wipe (SPEC §6). Correct password + explicit `wipe`.
         ESP_LOGW(TAG, "authenticated host wipe (correct password) -> REASON_HOST_WIPE");
         SelfDestruct::trigger(cfg, REASON_HOST_WIPE);
         return GATE_TRIGGERED;  // does not return in practice
+      }
+      if (isWipeRequest && lowSupply) {
+        // Brownout-suppression (SPEC §13): even a correct, deliberate host-wipe must not run on a
+        // sagging rail (risk of a half-completed erase). The password verified, so we BOOT normally
+        // and reset the counter; the owner can re-issue the wipe on a healthy supply.
+        ESP_LOGW(TAG, "low-supply boot: authenticated host wipe SUPPRESSED (booting instead; "
+                      "re-issue on a healthy supply) — reliability-first (SPEC §13)");
       }
       // Correct password ALWAYS wins: reset the counter and boot. Never wipes.
       rt.reset();
@@ -182,10 +208,22 @@ GateResult BootGate::armedFlow(GateConfig& cfg) {
     // SPEC §4.1 / §6: att_ct == 0 NEVER triggers (no failed attempt => no wipe), regardless of
     // max_att. We only reach the trigger after at least one real wrong attempt (att_ct >= 1).
     if (rt.att_ct != 0 && rt.att_ct >= cfg.max_att) {
+      // Tell the input layer it is locked (cosmetic).
+      Input::notifyLocked(0);
+      if (lowSupply) {
+        // Brownout-suppression (SPEC §13): a flaky rail must NEVER cause a wipe. We do NOT
+        // SelfDestruct. Instead we LOCK and KEEP RE-PROMPTING forever — the CORRECT password (handled
+        // at the top of this loop) is still the only way to boot, so there is no bypass. The persisted
+        // att_ct stays at/above max_att, so a later boot on a HEALTHY supply will enforce the real
+        // REASON_ATTEMPTS policy. We deliberately fall through to the re-prompt (no return, no
+        // trigger) rather than halting hard, so a correct password can still rescue the boot.
+        ESP_LOGW(TAG, "low-supply boot: max_att reached -> LOCK, re-prompting forever (NO wipe; "
+                      "correct password still boots) — reliability-first (SPEC §13)");
+        backoff(rt.att_ct);
+        continue;  // re-prompt; never SelfDestruct on a low-supply boot
+      }
       ESP_LOGW(TAG, "wrong-password count %u reached max_att %u -> REASON_ATTEMPTS",
                (unsigned)rt.att_ct, (unsigned)cfg.max_att);
-      // Tell the input layer it is locked (cosmetic; trigger does not return in practice).
-      Input::notifyLocked(0);
       SelfDestruct::trigger(cfg, REASON_ATTEMPTS);
       return GATE_TRIGGERED;  // does not return in practice
     }
@@ -207,30 +245,47 @@ GateResult BootGate::run() {
   // Step 1: load config from the `sgate` NVS namespace.
   GateConfig cfg = GateConfig::load();
 
+  // Step 1.5 (SPEC §8 robustness, red-team): RESUME an interrupted wipe. If the wipe-in-progress
+  // tombstone (`sgate_rt.wipe_armed`) is set, a previous self-destruct started and was cut short
+  // (power loss mid-erase). The board may now read as UNPROVISIONED (its guardcfg was partly
+  // erased) — but it must NOT report a clean PASS over residual data. Re-trigger SelfDestruct so the
+  // wipe FINISHES. This takes priority over every other branch, including the unprovisioned check
+  // below. (A real, interrupted wipe is already past the reliability-first "never initiate on a
+  // flaky rail" rule — the data is already partly gone; finishing it is the only safe end state.)
+  if (cfg.resumeWipe) {
+    ESP_LOGW(TAG, "wipe tombstone set (sgate_rt.wipe_armed=1) -> RESUMING interrupted self-destruct "
+                  "(SPEC §8). Will not report a clean PASS over residual data.");
+    SelfDestruct::trigger(cfg, REASON_ATTEMPTS);
+    return GATE_TRIGGERED;  // does not return in practice on a real wipe
+  }
+
   // Step 2: FAIL-SAFE — an unprovisioned board behaves like plain Marauder and can never wipe.
   if (!cfg.provisioned) {
     ESP_LOGI(TAG, "unprovisioned -> GATE_PASS (cannot wipe)");
     return GATE_PASS;
   }
 
-  // Step 4 (and SPEC §13): MASTER DISARMED — destruct is physically impossible. We also treat an
-  // undervoltage/brownout boot as DISARMED for reliability, even on an armed board: a flaky rail
-  // must never be allowed to fire the irreversible path or read the arming line. The correct
-  // password still boots normally; we simply skip the destruct-capable armed flow.
+  // Step 4: MASTER DISARMED — destruct is physically impossible (kept as-is). The correct password
+  // is cosmetic here; we simply skip the destruct-capable armed flow.
   if (cfg.armed == 0) {
     ESP_LOGI(TAG, "master DISARMED -> GATE_PASS (cannot wipe)");
     scrubConfigSecrets(cfg);  // RAM hygiene (SPEC §4.1)
     return GATE_PASS;
   }
 
-  if (gateSupplyIsLow()) {
-    ESP_LOGW(TAG, "undervoltage boot -> treated as DISARMED -> GATE_PASS (reliability-first)");
-    scrubConfigSecrets(cfg);  // RAM hygiene (SPEC §4.1)
-    return GATE_PASS;
+  // BROWNOUT-BYPASS FIX (SPEC §13, red-team): a low-supply/undervoltage boot must NOT early-return
+  // GATE_PASS on an ARMED board — that would boot an armed board with NO password (a full gate
+  // bypass). Instead we pass the low-supply state INTO armedFlow, where it ONLY SUPPRESSES
+  // destruction (skip dead-man pre-check; lock-and-reprompt forever at max_att instead of wiping).
+  // The CORRECT password is STILL required to boot, and a brownout can never cause a wipe.
+  const bool lowSupply = gateSupplyIsLow();
+  if (lowSupply) {
+    ESP_LOGW(TAG, "undervoltage boot on ARMED board: destruct SUPPRESSED but password STILL "
+                  "required (no bypass) — reliability-first (SPEC §13)");
   }
 
-  // Steps 5-7: master ARMED and supply trusted.
-  return armedFlow(cfg);
+  // Steps 5-7: master ARMED. armedFlow honors lowSupply to suppress (never bypass) destruction.
+  return armedFlow(cfg, lowSupply);
 }
 
 }  // namespace suicide

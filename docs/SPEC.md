@@ -117,7 +117,7 @@ rewritten without resetting the attempt counter).
 | `cfg_ver` | u8 | schema version | `1` |
 | `salt` | blob[16] | PBKDF2 salt (`os.urandom`) | — |
 | `pwhash` | blob[32] | PBKDF2-HMAC-SHA256(password, salt, iter) | — |
-| `kdf_iter` | u32 | PBKDF2 iteration count | `150000` |
+| `kdf_iter` | u32 | PBKDF2 iteration count | `10000` |
 | `kdf_dklen` | u8 | derived-key length | `32` |
 | `armed` | u8 | **master arm** (0=DISARMED safe, 1=ARMED) | `0` |
 | `arm_pin` | u8 | dead-man GPIO number | per board (`§7`) |
@@ -128,7 +128,7 @@ rewritten without resetting the attempt counter).
 | `wipe_ota` | u8 | erase Marauder app slot | `1` |
 | `wipe_nvs` | u8 | erase Marauder NVS | `1` |
 | `wipe_spiffs` | u8 | erase SPIFFS | `1` |
-| `wipe_sd` | u8 | overwrite + erase SD | `1` |
+| `wipe_sd` | u8 | best-effort SD file + free-space overwrite (no guaranteed format — see §8) | `1` |
 | `brick` | u8 | erase boot chain last (true brick) | `0` (T1) / `1` (T2) |
 | `sd_passes`| u8 | SD overwrite passes | `1` |
 
@@ -137,6 +137,12 @@ rewritten without resetting the attempt counter).
 |-----|------|---------|
 | `att_ct` | u8 | monotonic wrong-attempt counter; **commit before responding** so a power-cycle mid-attempt does not reset it. Reset to 0 only on a correct password. |
 | `lock_until` | u32 | epoch/uptime gate for exponential backoff (disarmed mode). |
+
+> **`kdf_iter` default is `10000` everywhere** (this table, §9, `GateConfig.h` `SUICIDE_KDF_ITER`,
+> and `provision.py` `DEFAULT_KDF_ITER` all agree). On **T1** the iteration count is **moot for
+> offline cracking** — the salted hash is dumpable from plaintext NVS, and PBKDF2 is GPU-cheap, so
+> a higher count buys no meaningful offline resistance. Real protection is **T2 (Flash Encryption
+> hides the hash) + a strong passphrase**; tune `kdf_iter` purely for boot-gate UX (~1 s verify).
 
 > **The plaintext password is never stored, never logged, never a CLI argument.** Only
 > `{salt, pwhash, kdf_iter, kdf_dklen}` exist on device. Host zeroizes the password buffer after
@@ -262,10 +268,16 @@ There is **no runtime crypto-erase on ESP32** (AES key eFuse is HW read+write-pr
 bulk erase + overwrite. Non-abortable once started. Under `SUICIDE_SAFE_MODE`, every step targets a
 scratch partition / logs only.
 
-1. **SD** (if `wipe_sd` & card present): overwrite every file + free space with `esp_fill_random`
-   (`sd_passes`), then card erase/format. *Best-effort* — FTL wear-leveling/over-provisioning means
-   remapped cells may survive; this is documented, not hidden. At-rest SD encryption (T2) is the
-   only real guarantee.
+1. **SD** (if `wipe_sd` & card present): the stock-SD path (`SelfDestruct.cpp` `wipeSDImpl`) does a
+   **best-effort file-level overwrite only** — recursively overwrite every file's contents with
+   `esp_fill_random` (`sd_passes` passes) and delete it, then a **single** pass over remaining free
+   space (fill one big random temp file until the card is full, then delete it). **There is NO
+   guaranteed card erase / FAT reformat / full-LBA secure-erase on this path** — `SD.end()` only
+   drops our open handles. A true full-LBA erase + reformat needs a **raw-sector backend (SdFat)**
+   supplied via the weak `wipeSDImpl` board override → **TODO** (RESEARCH-DIGEST.md). Even the
+   file+free-space overwrite is **best-effort**: FTL wear-leveling / over-provisioning means
+   remapped or spare cells may survive; this is documented, not hidden. At-rest SD encryption (T2)
+   is the only real guarantee.
 2. **Internal data**: `esp_partition_erase_range` over `ota_0` (Marauder app, if `wipe_ota`),
    `spiffs` (if `wipe_spiffs`), Marauder `nvs` (if `wipe_nvs`), coredump, then `guardcfg` **last of
    the data** (after config is already in RAM).
@@ -365,4 +377,4 @@ Tooltip copy lives in one place per front-end so it stays consistent and is easy
 | GPL/LGPL distribution (ESPAsyncWebServer LGPL static link) | needs legal note before redistributing binaries | `docs/LICENSING.md` |
 | SD remanence (FTL) | documented best-effort, not guaranteed | `§8`, `SAFETY.md` |
 | Low-battery boot policy | **undervoltage boot ⇒ treat as DISARMED** (reliability-first) | `BootGate` / `GateConfig` |
-| KDF iteration tuning | default 150000, tune on target | `§9` |
+| KDF iteration tuning | default 10000, tune on target for ~1 s UX | `§9` |
