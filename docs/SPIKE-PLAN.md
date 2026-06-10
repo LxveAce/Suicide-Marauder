@@ -184,3 +184,144 @@ Until a documented PASS exists for the target chip class, **`brick=1` must not b
 non-sacrificial board.** T2 (Secure Boot + Flash Encryption) additionally burns irreversible eFuses
 and must not be combined with `brick=1` in production until this spike has passed *and* the T2 eFuse
 flow has its own separate sign-off (SAFETY.md).
+
+---
+
+## 8. Stage 3 verification guide (step-by-step)
+
+This section provides a concrete, repeatable procedure for verifying that Stage 3 (boot-chain
+brick) works correctly on a given chip class. **Use a SACRIFICIAL board you are willing to
+permanently destroy.**
+
+### 8.1 What Stage 3 does
+
+Stage 3 (`SelfDestruct::brickBootChain`) is an `IRAM_ATTR`, non-returning function that raw-erases:
+
+1. **The partition table** at `0x8000` (1 sector, 4 KB) -- after this, the ROM bootloader cannot
+   locate any app image.
+2. **The bootloader** at `0x1000` (classic ESP32/S2) or `0x0` (S3/C3/C6/H2) -- after this, the
+   2nd-stage bootloader is gone and the chip has nothing to execute.
+3. **The running app region** (the OTA slot currently executing from) -- this is the UNVERIFIED
+   primitive. The CPU is executing from this region, so erasing it while running is the untested
+   edge case.
+
+The erase uses `esp_flash_erase_region` with raw offsets (not the partition API, which is invalid
+after the partition table is gone). Each erase writes the region to `0xFF` (NOR-erased state).
+
+### 8.2 Why a sacrificial board is required
+
+- Stage 3 is **PERMANENT and IRREVERSIBLE** at the software level. The chip itself is not damaged
+  (the silicon and mask ROM survive), but the flash contents are destroyed.
+- The boot chain (bootloader + partition table + app) is what makes the board functional. Without
+  it, the board is a paperweight until re-flashed.
+- On a T2 build (Secure Boot v2 + Flash Encryption), the eFuse burns are additionally irreversible
+  at the **hardware** level -- the chip can never be repurposed. Do NOT test T2 on a non-sacrificial
+  board.
+
+### 8.3 Step-by-step test procedure
+
+**Prerequisites:**
+- A sacrificial ESP32 board (same chip family + flash size as your target)
+- `esptool` installed on the host
+- Serial console capture tool (PuTTY, miniterm, screen, etc.)
+- The Suicide Marauder firmware built with `brick=1` and **NOT** `SUICIDE_SAFE_MODE`
+- `CONFIG_SPI_FLASH_DANGEROUS_WRITE_ALLOWED=y` in sdkconfig
+
+**Step 1: Flash Marauder + Suicide Marauder to the sacrificial board.**
+```sh
+# Flash the complete suicide bundle (bootloader + partitions + app + guardcfg)
+esptool --chip <chip> --port <PORT> write_flash \
+  <bootloader_offset> bootloader.bin \
+  0x8000 partitions.bin \
+  0x10000 app.bin \
+  <guardcfg_offset> guardcfg.bin \
+  <otadata_offset> <otadata_seed>
+```
+
+**Step 2: Provision the device with `armed=1`, `brick=1`.**
+```sh
+python host/provision.py \
+  --partitions firmware/partitions/suicide_4MB.csv \
+  --armed 1 --brick 1 --max-att 2
+```
+
+**Step 3: Capture the BEFORE flash dump.**
+```sh
+esptool --chip <chip> --port <PORT> read_flash 0x0 ALL before_full.bin
+```
+
+**Step 4: Arm the device and trigger the wipe.**
+Open a serial console at 115200 baud and trigger via one of:
+- Enter the wrong password `max_att` times (e.g. 2 wrong passwords).
+- Type `wipe`, then enter the correct password to authenticate.
+- Pull the GPIO arming pin (if wired) to trigger REASON_DEADMAN.
+
+**Capture the serial output.** The last lines should show the wipe stages progressing. Output will
+cease when the boot chain is erased (the CPU can no longer fetch instructions from flash).
+
+**Step 5: Verify the board does not boot.**
+Power-cycle the board. Expected behavior:
+- Serial output should be **silent** (no bootloader messages, no app output) or show only the
+  mask-ROM bootloader failing to find a valid image.
+- The board should NOT run Marauder or any application.
+
+**Step 6: Verify via esptool.**
+```sh
+# Enter ROM download mode (hold BOOT/GPIO0 during reset, or the board may already be in it)
+esptool --chip <chip> --port <PORT> read_flash 0x0 ALL after_full.bin
+
+# Verify the boot chain regions are all 0xFF:
+python -c "
+d = open('after_full.bin', 'rb').read()
+bl_off = 0x1000  # or 0x0 for S3/C3
+print('bootloader (0x%X-0x8000) all-FF:' % bl_off, d[bl_off:0x8000] == b'\xff' * (0x8000 - bl_off))
+print('partition table (0x8000-0x9000) all-FF:', d[0x8000:0x9000] == b'\xff' * 0x1000)
+# App region — check the first 1 MB after 0x10000 (adjust for your partition size):
+print('app region first 64K all-FF:', d[0x10000:0x20000] == b'\xff' * 0x10000)
+"
+```
+
+**Step 7: Verify recovery is possible (the chip is not dead).**
+```sh
+# Re-flash a fresh Marauder image to prove the chip still works:
+esptool --chip <chip> --port <PORT> write_flash \
+  <bootloader_offset> bootloader.bin \
+  0x8000 partitions.bin \
+  0x10000 app.bin
+
+# The board should boot normally after re-flash. If it does, the chip's mask ROM and flash
+# hardware survived — only the software was destroyed, which is the designed behavior.
+```
+
+### 8.4 Expected results
+
+| Check | Expected | Meaning |
+|-------|----------|---------|
+| Board boots after wipe? | **NO** | Boot chain successfully destroyed |
+| esptool can communicate? | **YES** (ROM download mode) | Mask ROM survived (expected for T1) |
+| Bootloader region all 0xFF? | **YES** | Stage 3 erased the bootloader |
+| Partition table all 0xFF? | **YES** | Stage 3 erased the partition table |
+| App region all 0xFF? | **YES** (ideally) or **partially** | Self-erase of running app -- the UNVERIFIED primitive |
+| Re-flash succeeds? | **YES** | Chip hardware undamaged |
+
+**App region partially erased** is an acceptable result for T1: the partition table + bootloader
+are already gone, so the device is non-bootable regardless. The running-app self-erase is a
+defense-in-depth measure; its partial completion does not reduce the security posture because
+the boot chain is the load-bearing target.
+
+### 8.5 Recovery procedure
+
+If you need to recover a board after Stage 3 verification (or an accidental brick):
+
+1. Hold BOOT/GPIO0 LOW during reset to enter ROM serial download mode.
+2. Flash a complete image (bootloader + partition table + app):
+   ```sh
+   esptool --chip <chip> --port <PORT> write_flash \
+     <bootloader_offset> bootloader.bin \
+     0x8000 partitions.bin \
+     0x10000 app.bin
+   ```
+3. The board should boot normally. The guardcfg partition will be empty (unprovisioned), so the
+   gate will return GATE_PASS.
+4. For T2 boards with Secure Boot v2 eFuses burned: **recovery is NOT possible.** The chip will
+   only boot images signed with the burned key. This is by design -- T2 is irreversible.

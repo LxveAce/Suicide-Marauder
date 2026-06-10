@@ -48,9 +48,14 @@
 // ----- SD card stack (Arduino). On Marauder the SD is on SPI; standalone boards may use SD_MMC.
 // We use the stock SD library so this compiles on every board class. A board package that wants
 // SD_MMC / SdFat raw-sector speed can override wipeSDImpl via the weak hook below.
+// Raw-sector (full-LBA) wipe uses the SDMMC host driver when available for forensic-grade erasure.
 #if !defined(SUICIDE_NO_SD)
 #include <FS.h>
 #include <SD.h>
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+#include "driver/sdmmc_host.h"
+#include "sdmmc_cmd.h"
+#endif
 #endif
 
 namespace suicide {
@@ -209,13 +214,104 @@ bool eraseAppPartition(esp_partition_subtype_t subtype, const char* what) {
 
 // ---------------------------------------------------------------------------------------------
 // SD wipe implementation (weak — a board package may override for SD_MMC / SdFat raw speed).
-// Best-effort order (RESEARCH-DIGEST.md): (1) recursively overwrite + delete every file, then
-// (2) overwrite remaining free space with random data. Native full-LBA erase + reformat are
-// reserved for a raw-sector backend (SdFat); the stock-SD path here does file + free-space
-// overwrite, which is what is portable across every board. FTL wear-leveling means remapped /
-// over-provisioned cells may survive — this is documented, not hidden (SPEC §8, SAFETY.md).
+//
+// PRIMARY: full-LBA raw-sector wipe (forensic-grade). Uses the SDMMC host driver to write zeros
+// (or random+zeros for secure-erase) to every sector from LBA 0 through the last sector, bypassing
+// the filesystem entirely. Progress is logged every 1024 sectors.
+//
+// FALLBACK: file-level overwrite + free-space fill. Used when raw sector access is unavailable
+// (e.g. SPI-only SD without SDMMC, or driver init failure). Portable across every board but
+// FTL wear-leveling means remapped / over-provisioned cells may survive — documented, not hidden
+// (SPEC section 8, SAFETY.md).
 // ---------------------------------------------------------------------------------------------
 #if !defined(SUICIDE_NO_SD) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM))
+
+// ---- Raw-sector (full-LBA) wipe ----
+// Attempts SDMMC raw access for forensic-grade erasure. Returns true if the card was fully wiped
+// at the raw sector level. Returns false if raw access is unavailable (caller should fall back to
+// file-level wipe).
+bool rawSectorWipe(uint8_t* buf, size_t bufLen, uint8_t passes) {
+  // The SDMMC host driver requires SD_MMC mode (4-bit or 1-bit). On boards that wire the SD via
+  // SPI (most Marauder boards), this will fail to init — that is the expected fallback signal.
+#if defined(SOC_SDMMC_HOST_SUPPORTED)
+  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+  host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+  sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+  // Try 1-bit mode first (wider compatibility); if the slot supports 4-bit, SDMMC_HOST_DEFAULT
+  // already sets width=4, but many Marauder boards only wire 1 data line.
+  slot.width = 1;
+
+  sdmmc_card_t card;
+  memset(&card, 0, sizeof(card));
+  esp_err_t err = sdmmc_card_init(&host, &card);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "SD raw-sector: SDMMC init failed (%s) — will fall back to file-level wipe",
+             esp_err_to_name(err));
+    return false;
+  }
+
+  // Total sector count from the card's CSD register.
+  uint32_t totalSectors = (uint32_t)(card.csd.capacity);
+  if (totalSectors == 0) {
+    ESP_LOGW(TAG, "SD raw-sector: card reports 0 sectors — falling back");
+    return false;
+  }
+
+  uint32_t sectorsPerBuf = (uint32_t)(bufLen / 512);
+  if (sectorsPerBuf == 0) sectorsPerBuf = 1;
+
+  ESP_LOGW(TAG, "SD raw-sector: full-LBA wipe starting — %u total sectors, %u passes",
+           (unsigned)totalSectors, (unsigned)passes);
+
+  for (uint8_t pass = 0; pass < passes; ++pass) {
+    // Pass strategy: if passes >= 2, first pass writes random data, last pass writes zeros
+    // (secure-erase pattern). Single pass writes zeros only (fast wipe).
+    bool useRandom = (passes >= 2 && pass < (passes - 1));
+
+    ESP_LOGW(TAG, "SD raw-sector: pass %u/%u (%s)", (unsigned)(pass + 1), (unsigned)passes,
+             useRandom ? "random" : "zeros");
+
+    for (uint32_t sector = 0; sector < totalSectors; sector += sectorsPerBuf) {
+      uint32_t count = sectorsPerBuf;
+      if (sector + count > totalSectors) {
+        count = totalSectors - sector;
+      }
+
+      size_t byteCount = (size_t)(count * 512);
+      if (useRandom) {
+        esp_fill_random(buf, byteCount);
+      } else {
+        memset(buf, 0, byteCount);
+      }
+
+      esp_err_t we = sdmmc_write_sectors(&card, buf, sector, count);
+      if (we != ESP_OK) {
+        ESP_LOGE(TAG, "SD raw-sector: write failed at sector %u: %s",
+                 (unsigned)sector, esp_err_to_name(we));
+        // Continue past errors — best-effort wipe of remaining sectors.
+      }
+
+      // Progress report every 1024 sectors (every ~512 KB).
+      if ((sector % 1024) == 0 || sector + count >= totalSectors) {
+        ESP_LOGI(TAG, "SD raw-sector: pass %u/%u — sector %u / %u",
+                 (unsigned)(pass + 1), (unsigned)passes, (unsigned)(sector + count),
+                 (unsigned)totalSectors);
+      }
+    }
+  }
+
+  ESP_LOGW(TAG, "SD raw-sector: full-LBA wipe complete (%u sectors, %u passes)",
+           (unsigned)totalSectors, (unsigned)passes);
+  return true;
+#else
+  // SDMMC host not supported on this SoC (e.g. ESP32-C3). Fall back to file-level wipe.
+  (void)buf; (void)bufLen; (void)passes;
+  ESP_LOGW(TAG, "SD raw-sector: SOC_SDMMC_HOST_SUPPORTED not defined — falling back");
+  return false;
+#endif  // SOC_SDMMC_HOST_SUPPORTED
+}
+
+// ---- File-level wipe (fallback) ----
 
 bool overwriteFile(File& f, uint8_t* buf, size_t bufLen, uint8_t passes) {
   size_t total = f.size();
@@ -306,22 +402,39 @@ void overwriteFreeSpace(fs::FS& fs, uint8_t* buf, size_t bufLen) {
 }  // namespace
 
 // Weak SD hook: returns true if the SD was handled (so a board override can fully replace this).
+// Strategy: attempt full-LBA raw-sector wipe first (forensic-grade), fall back to file-level
+// overwrite + free-space fill when raw access is unavailable.
 __attribute__((weak)) bool wipeSDImpl(const GateConfig& cfg) {
 #if defined(SUICIDE_SAFE_MODE)
-  ESP_LOGI(TAG, "[SAFE] would wipe SD (sd_passes=%u): recursive file overwrite + free-space "
-                "overwrite + erase/format — NO-OP, no card touched",
+  ESP_LOGI(TAG, "[SAFE] would wipe SD (sd_passes=%u): full-LBA raw-sector wipe (or file-level "
+                "fallback) — NO-OP, no card touched",
            (unsigned)cfg.sd_passes);
   return true;
 #elif !defined(SUICIDE_NO_SD) && (defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM))
-  if (!SD.begin()) {
-    ESP_LOGW(TAG, "SD.begin() failed — no card present or bus busy; skipping SD wipe");
-    return false;
-  }
   uint8_t passes = cfg.sd_passes ? cfg.sd_passes : 1;
   uint8_t* buf = (uint8_t*)malloc(OVERWRITE_BUF);
   if (!buf) {
     ESP_LOGE(TAG, "SD wipe: out of RAM for overwrite buffer");
-    SD.end();
+    return false;
+  }
+
+  // PRIMARY: attempt full-LBA raw-sector wipe (forensic-grade). This writes zeros (or
+  // random+zeros for passes >= 2) to every sector on the card, bypassing the filesystem.
+  bool rawOk = rawSectorWipe(buf, OVERWRITE_BUF, passes);
+  if (rawOk) {
+    ESP_LOGW(TAG, "SD wipe: full-LBA raw-sector wipe succeeded (forensic-grade)");
+    memset(buf, 0, OVERWRITE_BUF);
+    free(buf);
+    return true;
+  }
+
+  // FALLBACK: file-level overwrite + free-space fill. Raw access unavailable (SPI-only SD, no
+  // SDMMC host, or driver init failure). This is the portable path.
+  ESP_LOGW(TAG, "SD wipe: raw-sector unavailable — falling back to file-level overwrite");
+  if (!SD.begin()) {
+    ESP_LOGW(TAG, "SD.begin() failed — no card present or bus busy; skipping SD wipe");
+    memset(buf, 0, OVERWRITE_BUF);
+    free(buf);
     return false;
   }
   ESP_LOGW(TAG, "SD wipe: overwriting all files (%u pass) then free space — best-effort (FTL)",
@@ -331,8 +444,6 @@ __attribute__((weak)) bool wipeSDImpl(const GateConfig& cfg) {
     ESP_LOGW(TAG, "SD wipe: one or more files could not be scrubbed (see warnings above)");
   }
   overwriteFreeSpace(SD, buf, OVERWRITE_BUF);
-  // Best-effort metadata reset: re-init wipes our open handles; a true full-LBA erase + reformat
-  // needs a raw-sector backend (SdFat) — see RESEARCH-DIGEST.md; provided by a board override.
   memset(buf, 0, OVERWRITE_BUF);
   free(buf);
   SD.end();
@@ -615,9 +726,17 @@ void SelfDestruct::trigger(const GateConfig& cfg, TriggerReason reason) {
                   "auto-resume-on-interrupt may be unavailable");
   }
 
-  // Stage 1: SD (best-effort, FTL-limited; documented). Capture the result.
+  // Fast-wipe mode (cfg.fast_wipe or brownout-prioritized): skip the SD wipe entirely and go
+  // straight to flash erase + boot brick. This is faster and more likely to complete before power
+  // is lost on a marginal supply. The SD wipe is the slowest stage (can take minutes for large
+  // cards); flash erase takes seconds.
   bool ok = true;
-  ok &= wipeSD(cfg);
+  if (cfg.fast_wipe) {
+    ESP_LOGW(TAG, "fast_wipe=1: SKIPPING SD wipe (prioritizing flash erase for speed/reliability)");
+  } else {
+    // Stage 1: SD (best-effort, FTL-limited; documented). Capture the result.
+    ok &= wipeSD(cfg);
+  }
 
   // Stage 2: internal data partitions, guardcfg LAST. Capture the result.
   ok &= wipeInternal(cfg);

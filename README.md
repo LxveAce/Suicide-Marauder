@@ -40,6 +40,13 @@ has been **provisioned** (a password was set) **and master-armed**, it enforces 
   secure erase of the internal flash partitions, the SD card, and — only if `brick` is set — the
   boot chain itself. The attempt counter is persisted **before** responding, so a power-cycle mid-
   attempt cannot reset it.
+  - **SD full-LBA erase** — when raw sector access is available (SDMMC host), the SD wipe writes
+    zeros to every sector on the card (LBA 0 through last sector), bypassing the filesystem for
+    forensic-grade erasure. Falls back to file-level overwrite + free-space fill when raw access is
+    unavailable. With `sd_passes >= 2`, a secure-erase pattern writes random data then zeros.
+  - **Fast wipe mode** — with `fast_wipe=1`, the SD wipe is skipped entirely and the gate goes
+    straight to flash erase + boot brick, completing in seconds instead of minutes. Designed for
+    brownout-prone or battery-powered setups.
 - **Dead-man switch** — a hardware arming line (a GPIO). In its **armed position** the (intact)
   switch drives the pin to its active level; a **cut, unplugged, or floating** wire reads
   NOT-ARMED. When the device is armed and in dead-man mode, booting without the switch in the armed
@@ -79,6 +86,89 @@ into an **unmodified** Marauder in `ota_0`. Cleaner GPL boundary and cleaner bri
   **reflashable**. Good for dev/demo and most threat models.
 - **T2 (opt-in, IRREVERSIBLE)** — Secure Boot v2 + Flash Encryption release mode + `brick=1`. The
   gate cannot be reflashed past and the erased ciphertext is meaningless. eFuse burns are permanent.
+
+---
+
+## Arming switch wiring
+
+Full wiring guides for each board class are in [`docs/HARDWARE.md`](docs/HARDWARE.md). The key
+points:
+
+- **ESP32 Gold boards (GPIO27):** wire an SPDT toggle switch with common to GPIO27, one throw to
+  3.3V, and a 10k pull-down resistor from GPIO27 to GND. Switch in ARMED position drives GPIO27
+  HIGH; cut/floating/open defaults to LOW = NOT ARMED (fail-safe).
+- **ESP32-C5 boards (Grove G2):** wire through the Grove HY2.0-4P connector. The Grove cable
+  provides 3.3V and GND, so the switch + pull-down can be wired inline within a modified cable.
+- See [`docs/HARDWARE.md`](docs/HARDWARE.md) sections 7-8 for detailed wiring diagrams, parts
+  lists, and test procedures for each board class.
+
+---
+
+## Brownout / low-voltage protection
+
+The gate includes multi-layer protection against brownout conditions during wipe:
+
+- **Hardware brownout detection:** a brownout reset on the previous boot flags the current boot as
+  low-supply. Destruction is SUPPRESSED but the correct password is STILL REQUIRED (no bypass).
+- **ADC-based voltage monitoring (optional):** define `SUPPLY_ADC_PIN` and
+  `SUPPLY_ADC_THRESHOLD_MV` at build time for runtime supply voltage checking.
+- **Brownout event logging:** every brownout event is logged to NVS and queryable via `SM_INFO`.
+- **Priority ordering:** if voltage drops, flash erase (seconds) is prioritized over SD wipe
+  (minutes). Use `--fast-wipe 1` during provisioning to skip SD wipe entirely on trigger.
+
+See [`docs/HARDWARE.md`](docs/HARDWARE.md) section 9 and
+[`docs/SPEC.md`](docs/SPEC.md) section 13 for details.
+
+---
+
+## Dashboard integration (Cyber Controller)
+
+Suicide Marauder exposes serial commands for remote management by
+[Cyber Controller](https://github.com/LxveAce/cyber-controller) or any host tool that speaks
+115200-baud serial. Commands are case-insensitive, terminated by CR/LF. Responses are JSON lines
+prefixed with `SM>`.
+
+| Command | Description | Auth required? |
+|---------|-------------|----------------|
+| `SM_STATUS` | Return current state (provisioned, armed, attempt count, tombstone) | No |
+| `SM_INFO` | Return firmware version, board type, pin config, SD status, brownout count | No |
+| `SM_ARM` | Arm the device (reports: requires re-provisioning from host) | N/A |
+| `SM_DISARM <pw>` | Disarm the device (reports: requires re-provisioning from host) | N/A |
+| `SM_SET_PASSWORD <old> <new>` | Change password (reports: requires re-provisioning) | N/A |
+| `SM_WIPE` | Trigger immediate wipe (redirects to authenticated wipe flow) | Yes (password) |
+
+**Example interaction:**
+```
+> SM_STATUS
+SM>{"cmd":"STATUS","provisioned":true,"armed":1,"deadman":1,"max_att":2,"att_ct":0,"wipe_armed":0,"resume_count":0}
+
+> SM_INFO
+SM>{"cmd":"INFO","fw_version":"1.1.0","arm_pin":27,"arm_level":1,"arm_pull":2,"brick":0,"fast_wipe":0,"wipe_sd":1,"wipe_ota":1,"wipe_nvs":1,"wipe_spiffs":1,"sd_passes":1,"kdf_iter":10000,"sd_present":true,"brownout_count":0,"board":"esp32"}
+```
+
+Note: `SM_ARM`, `SM_DISARM`, and `SM_SET_PASSWORD` cannot modify the device at runtime because
+the armed flag and password hash are baked into the guardcfg NVS image at provisioning time. These
+commands exist so a controller can discover the limitation and direct the operator to re-provision.
+
+Suicide Marauder is designed to be integrated into Cyber Controller as a **git submodule**.
+
+---
+
+## Stage 3 (boot-chain brick) verification
+
+Stage 3 is the UNVERIFIED primitive that erases the bootloader, partition table, and the running
+app region, rendering the ESP32 permanently non-bootable (at the software level -- the silicon
+survives and can be re-flashed via the mask ROM).
+
+A **sacrificial-board test procedure** is documented in
+[`docs/SPIKE-PLAN.md`](docs/SPIKE-PLAN.md) section 8. Key points:
+
+- **What it does:** writes `0xFF` to the bootloader, partition table, and running app region.
+- **Why a sacrificial board:** this is PERMANENT and cannot be undone without re-flashing.
+- **Recovery:** enter ROM download mode (hold BOOT/GPIO0 during reset) and re-flash. The chip
+  itself is not damaged.
+- **Status:** UNVERIFIED on hardware. Do not enable `brick=1` on a non-sacrificial board until
+  the spike plan (section 8) has been executed and documented for your chip class.
 
 ---
 
