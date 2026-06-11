@@ -210,10 +210,9 @@ All 4 attached flashable boards are **classic ESP32**, for which the brick is pr
 chip families (S3/C3/C5) are a per-chip register TODO (none attached). COM8 (4" ST7796) is flashable and
 free for more testing next session.
 
-**Minor (non-blocking) note:** on the COM7 wrong-password trigger the gate briefly printed
-`suicide-gate: locked for 0s.` immediately before the (silent) brick — the wipe still fired and fully
-obliterated, so this is a cosmetic message-ordering quirk in the armed wipe path to tidy next session,
-not a functional bug.
+**FIXED (2026-06-11):** the `suicide-gate: locked for 0s.` that printed right before the wrong-attempt
+wipe is gone — `notifyLocked()` now fires ONLY on the low-supply LOCK path (BootGate.cpp), so the wipe
+is no longer telegraphed (anti-forensic + correctness). Re-tested on COM7: wrong #2 -> silent obliteration.
 
 **Universal gate added to the repo:** `firmware/guardian/guardian.ino` + README — the standalone,
 firmware-agnostic gate (builds at 349 KB with no Marauder/TFT/NimBLE), hardware-validated above.
