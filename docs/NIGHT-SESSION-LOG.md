@@ -99,4 +99,39 @@ erased + overwritten). Only the running-app + boot-chain self-erase needed the R
 - Marker-debugged the brick hang: `Cache_Read_Disable` wedged the chip; switched to the IDF
   `spi_flash_disable_interrupts_caches_and_other_cpu()`. **Full obliteration verified (all 0xFF).**
 - Added TG0/TG1 watchdog disable to the brick (RTC WDT alone wasn't enough — saw TG0WDT_SYS_RESET).
-  Rebuild in progress to confirm a clean single-pass wipe.
+  **Re-verified on the CYD: FULL OBLITERATION PASS — every region 0xFF, clean single pass.**
+- Production cleanup: removed the debug `brickMark` UART markers (a wiping board now emits nothing),
+  consolidated the WDT-disable, fixed the SD no-card abort (raw SDMMC path now opt-in `-DSUICIDE_SD_SDMMC`;
+  default = abort-safe `SD.begin()` file-level). Production build compiles clean.
+- **COMMITTED + PROPAGATED** the working brick: canonical `edf9032`, universal-flasher `fd6ad03`,
+  headless-marauder-gui `8cb2906`, cyber-controller submodule bump `1d785fc`. (Earlier session work —
+  guardcfg 0x3000, owner-safety pw guards, CYD touch define — was already at `7cd17a8`.)
+
+### HARDWARE FLEET (as the owner attached boards through the night)
+| Port | Board | Chip | DL mode | Use |
+|------|-------|------|---------|-----|
+| COM5 | CYD 2432S028 (2.8" touch) | ESP32 | OK (CH340) | wipe HW-validated; bricked from test, recover w/ Marauder reflash |
+| COM7 | blank/erased ESP32 dev | ESP32 (CH340K) | OK | free board — serial/headless wipe testing |
+| COM8 | AITRIP 4.0" touch (ST7796 320x480) | ESP32, 8MB (GD c4/6016) | OK (CH340) | NEW Marauder board to add (ST7796 not stock) |
+| COM3 | ESP32-WROOM, ESP-AT v2.4.0 | ESP32 (CP210x) | **BLOCKED** ("boot mode 0x13") | headless; needs BOOT-button tap (no auto-program circuit) |
+| COM4 | Pi Zero 2 W (pwnagotchi) | ARM Linux | n/a (serial gadget, **no Win driver bound**) | NOT esptool-flashable; SD-image + SSH platform; Waveshare 2.13" V4 e-ink |
+
+### PWNAGOTCHI (Pi Zero 2 W) — confirmed from Projects/INVENTORY.md
+- Pi Zero 2 W + **Waveshare 2.13" e-ink HAT V4** + PiSugar S. "Firmware" = an SD-card OS image (NOT
+  esptool). Display fix: the 2.13" **V4** needs `ui.display.type = "waveshare_v4"`, supported only by the
+  **jayofelony** pwnagotchi fork (original evilsocket image stops at v2/v3). To debug live I need the Pi
+  reachable as a USB **Ethernet** gadget (SSH pi@10.0.0.2, host 10.0.0.1) — it currently only enumerates
+  a driverless USB **serial** gadget (COM4, can't open). **OWNER CHOICE C4 (logged): reflash the Pi SD
+  with the jayofelony image set to waveshare_v4 + USB-ethernet gadget so I can SSH-debug it next session.**
+
+### PLAN FOR THE REMAINING NIGHT (in priority order)
+1. Generic-ESP32 (no display) serial wipe test on COM7 — prove the wipe on a non-display config.
+2. Profile README + project READMEs + website updates (explicit owner ask).
+3. 4" ST7796 board (COM8): research + attempt Marauder support (TFT_eSPI ST7796 setup + board define),
+   and/or at least HW-validate the (display-agnostic) wipe on it.
+4. Universal dead-man switch research/design (GUARDIAN factory-app boots first, gates, hands off to ANY
+   firmware in ota_0 — firmware-agnostic; vs the current FORK which is Marauder-specific).
+5. Dashboard (cyber-controller): optional install password, boot-attack hardening, cross-comm/cross-
+   resource (one device's AP usable+executable by another), stress test the UIs.
+6. Recover the CYD (reflash official Marauder v1.12.1).
+7. Red-team each + loop. Log + save choices.
