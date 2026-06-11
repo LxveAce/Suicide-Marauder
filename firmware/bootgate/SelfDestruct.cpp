@@ -146,6 +146,69 @@ const esp_partition_t* findScratchPartition() {
 }
 #endif  // SUICIDE_SAFE_MODE (findScratchPartition)
 
+// ---------------------------------------------------------------------------------------------
+// Forensic OVERWRITE-THEN-ERASE ("write over all deleted items" — SPEC §8). esp_partition_erase
+// alone returns NOR cells to 0xFF; an overwrite pass first REPROGRAMS every cell with true-random
+// data, scrambling the analog charge / threshold-voltage signature of the original contents, after
+// which a FINAL erase leaves the region in the clean 0xFF state (no residual random pattern that
+// could hint the region was ever used). NOR can only be programmed after an erase, so each pass is
+// erase -> write-random; a trailing erase removes the last random pass. g_flash_passes==0 degrades
+// to a single plain erase (the historical behavior / fast-wipe path). These run on internal-flash
+// data + non-running app partitions ONLY — never the running app (that is the brick stage's job).
+//
+// Module-scope knobs are set once by wipeInternal() from GateConfig so cfg need not thread through
+// every erase helper + retry wrapper. Anonymous-namespace statics => file-internal linkage.
+static uint8_t g_flash_passes = 1;   // random overwrite passes before the final clean erase
+static bool    g_verify_wipe  = true; // read back + confirm all-0xFF after erase
+
+constexpr size_t SCRUB_BUF = 4096;   // sector-sized scrub / verify buffer
+
+// Overwrite (g_flash_passes random passes) then a final clean erase. Returns true iff the region is
+// left fully erased. On OOM it falls back to a single plain erase — destruction must never be
+// silently skipped. SAFE MODE never reaches here (the callers' SAFE branch is log-only).
+bool overwriteThenErase(const esp_partition_t* part) {
+  if (g_flash_passes == 0) {
+    return esp_partition_erase_range(part, 0, part->size) == ESP_OK;
+  }
+  uint8_t* buf = (uint8_t*)malloc(SCRUB_BUF);
+  if (!buf) {
+    ESP_LOGW(TAG, "overwrite '%s': OOM — single-erase fallback", part->label);
+    return esp_partition_erase_range(part, 0, part->size) == ESP_OK;
+  }
+  bool ok = true;
+  for (uint8_t pass = 0; pass < g_flash_passes && ok; ++pass) {
+    if (esp_partition_erase_range(part, 0, part->size) != ESP_OK) { ok = false; break; }
+    for (size_t off = 0; off < part->size; off += SCRUB_BUF) {
+      size_t chunk = (part->size - off) < SCRUB_BUF ? (part->size - off) : SCRUB_BUF;
+      esp_fill_random(buf, chunk);                       // true-random (EntropyGuard active)
+      if (esp_partition_write(part, off, buf, chunk) != ESP_OK) { ok = false; break; }
+    }
+  }
+  // Final clean erase ALWAYS — never leave the random overwrite pattern on the chip, even if a
+  // pass failed partway (a partial random region is still "a trace").
+  if (esp_partition_erase_range(part, 0, part->size) != ESP_OK) ok = false;
+  memset(buf, 0, SCRUB_BUF);  // don't leave a random copy in heap
+  free(buf);
+  return ok;
+}
+
+// Read the whole partition back and confirm every byte is 0xFF ("make sure the wiping is good").
+// OOM -> cannot verify; returns true (don't fail an otherwise-good wipe on a verify alloc alone).
+bool verifyErased(const esp_partition_t* part) {
+  uint8_t* buf = (uint8_t*)malloc(SCRUB_BUF);
+  if (!buf) return true;
+  bool clean = true;
+  for (size_t off = 0; off < part->size && clean; off += SCRUB_BUF) {
+    size_t chunk = (part->size - off) < SCRUB_BUF ? (part->size - off) : SCRUB_BUF;
+    if (esp_partition_read(part, off, buf, chunk) != ESP_OK) { clean = false; break; }
+    for (size_t i = 0; i < chunk; ++i) {
+      if (buf[i] != 0xFF) { clean = false; break; }
+    }
+  }
+  free(buf);
+  return clean;
+}
+
 // Erase one named data partition by (subtype, label). In SAFE MODE this is LOG-ONLY: it performs
 // ZERO esp_partition_erase_range and never touches any partition (live OR scratch). Returns true on
 // success / simulated success.
@@ -168,11 +231,15 @@ bool eraseDataPartition(esp_partition_subtype_t subtype, const char* label) {
     ESP_LOGW(TAG, "data '%s' not present — skipping", label ? label : "?");
     return true;  // absence is not a failure
   }
-  ESP_LOGW(TAG, "erasing data '%s' (%u bytes @0x%06x)", label ? label : "?",
-           (unsigned)part->size, (unsigned)part->address);
-  esp_err_t e = esp_partition_erase_range(part, 0, part->size);
-  if (e != ESP_OK) {
-    ESP_LOGE(TAG, "erase '%s' failed: %s", label ? label : "?", esp_err_to_name(e));
+  ESP_LOGW(TAG, "scrubbing data '%s' (%u bytes @0x%06x; %u overwrite pass + erase)",
+           label ? label : "?", (unsigned)part->size, (unsigned)part->address,
+           (unsigned)g_flash_passes);
+  if (!overwriteThenErase(part)) {
+    ESP_LOGE(TAG, "overwrite/erase data '%s' failed", label ? label : "?");
+    return false;
+  }
+  if (g_verify_wipe && !verifyErased(part)) {
+    ESP_LOGE(TAG, "post-erase verify data '%s' FAILED (not all 0xFF)", label ? label : "?");
     return false;
   }
   return true;
@@ -199,11 +266,14 @@ bool eraseAppPartition(esp_partition_subtype_t subtype, const char* what) {
     ESP_LOGW(TAG, "app %s not present — skipping", what);
     return true;
   }
-  ESP_LOGW(TAG, "erasing app %s (%u bytes @0x%06x)", what, (unsigned)part->size,
-           (unsigned)part->address);
-  esp_err_t e = esp_partition_erase_range(part, 0, part->size);
-  if (e != ESP_OK) {
-    ESP_LOGE(TAG, "erase app %s failed: %s", what, esp_err_to_name(e));
+  ESP_LOGW(TAG, "scrubbing app %s (%u bytes @0x%06x; %u overwrite pass + erase)", what,
+           (unsigned)part->size, (unsigned)part->address, (unsigned)g_flash_passes);
+  if (!overwriteThenErase(part)) {
+    ESP_LOGE(TAG, "overwrite/erase app %s failed", what);
+    return false;
+  }
+  if (g_verify_wipe && !verifyErased(part)) {
+    ESP_LOGE(TAG, "post-erase verify app %s FAILED (not all 0xFF)", what);
     return false;
   }
   return true;
@@ -511,6 +581,16 @@ bool eraseAppPartitionRetry(esp_partition_subtype_t subtype, const char* what) {
 // ---------------------------------------------------------------------------------------------
 bool SelfDestruct::wipeInternal(const GateConfig& cfg) {
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+  // Forensic overwrite knobs (read by the erase helpers): in fast_wipe / brownout-priority mode
+  // skip the random overwrite — a plain erase is seconds faster and more likely to finish on a
+  // marginal supply (the boot chain still ends erased). Otherwise use cfg.flash_passes random
+  // overwrite passes + a final clean erase, then verify all-0xFF.
+  g_flash_passes = cfg.fast_wipe ? 0 : cfg.flash_passes;
+  g_verify_wipe  = true;
+  EntropyGuard entropy;  // true-random overwrite payload for the internal scrub
+  ESP_LOGW(TAG, "internal scrub: flash_passes=%u (fast_wipe=%u), verify=on",
+           (unsigned)g_flash_passes, (unsigned)cfg.fast_wipe);
+
   bool ok = true;
 
   const esp_partition_t* running = esp_ota_get_running_partition();

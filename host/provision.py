@@ -272,6 +272,7 @@ def build_nvs_rows(args, salt, pwhash):
         ("wipe_sd", "data", "u8", str(args.wipe_sd)),
         ("brick", "data", "u8", str(args.brick)),
         ("sd_passes", "data", "u8", str(args.sd_passes)),
+        ("flash_passes", "data", "u8", str(args.flash_passes)),
         ("fast_wipe", "data", "u8", str(args.fast_wipe)),
     ]
     return rows
@@ -657,6 +658,9 @@ def build_arg_parser():
                    help="erase boot chain last for a true brick. Default 0 (T1). T2 sets 1.")
     g.add_argument("--sd-passes", dest="sd_passes", type=_u8("sd_passes"), default=1,
                    help="SD overwrite passes (default 1; 2+ = secure-erase: random then zeros).")
+    g.add_argument("--flash-passes", dest="flash_passes", type=_u8("flash_passes"), default=1,
+                   help="internal-flash OVERWRITE passes (random) before the final clean erase "
+                        "(default 1; 0=erase-only/legacy). Forced to 0 by --fast-wipe at wipe time.")
     g.add_argument("--fast-wipe", dest="fast_wipe", type=int, choices=(0, 1), default=0,
                    help="1=skip SD on wipe, only flash erase + boot brick (brownout-safe). Default 0.")
     g.add_argument("--kdf-iter", dest="kdf_iter", type=int, default=DEFAULT_KDF_ITER,

@@ -72,6 +72,9 @@ struct GateConfig {
   uint8_t  wipe_ota = 1, wipe_nvs = 1, wipe_spiffs = 1, wipe_sd = 1;
   uint8_t  brick = 0;                    // T1 default 0; T2 default 1 (SPEC §8)
   uint8_t  sd_passes = 1;
+  uint8_t  flash_passes = 1;             // internal-flash OVERWRITE passes (random) before the final
+                                         // clean erase ("write over all deleted items", SPEC §8). 0 =
+                                         // erase-only (legacy/fast). fast_wipe forces 0 for brownout.
   uint8_t  fast_wipe = 0;                // 1: skip SD, only flash erase + boot brick (brownout-safe)
 
   // Load from `sgate` NVS namespace. Missing pwhash => provisioned=false (cannot wipe).
