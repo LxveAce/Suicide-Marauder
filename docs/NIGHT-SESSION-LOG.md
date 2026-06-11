@@ -198,10 +198,25 @@ firmware_vault, health_monitor, suicide_setup). To "make every feature work unde
   Suicide-Marauder README (brick now HARDWARE-VALIDATED), esp32marauder.com (obliteration + SEO).
 - This log.
 
-**STRESS/COVERAGE NOTES:** the wipe was triggered + fully verified **twice** on the CYD (2 clean
-obliterations, all-0xFF read-back). All 4 attached flashable boards are **classic ESP32**, for which the
-brick is proven; other chip families are a per-chip TODO (no S3/C3/C5 attached). COM7 (blank ESP32) +
-COM8 (4" ST7796) are flashable and free for further destructive serial-path testing next session.
+**STRESS/COVERAGE NOTES:** obliteration verified across **2 boards, 2 trigger paths, and the
+firmware-agnostic gate**:
+- CYD (touch, **dead-man** trigger) — full obliteration **×2** (all-0xFF read-back), then recovered to
+  working Marauder.
+- COM7 blank ESP32 — **standalone universal gate (`firmware/guardian/guardian.ino`, NO Marauder)**,
+  serial input, **wrong-password ×2** trigger (the owner's core "2 fails → wipe" spec) — full
+  obliteration (all-0xFF). This proves the **universal dead-man switch** (gate works with no host
+  firmware) AND the serial-input + attempt-counter paths AND a generic ESP32 dev board.
+All 4 attached flashable boards are **classic ESP32**, for which the brick is proven end to end; other
+chip families (S3/C3/C5) are a per-chip register TODO (none attached). COM8 (4" ST7796) is flashable and
+free for more testing next session.
+
+**Minor (non-blocking) note:** on the COM7 wrong-password trigger the gate briefly printed
+`suicide-gate: locked for 0s.` immediately before the (silent) brick — the wipe still fired and fully
+obliterated, so this is a cosmetic message-ordering quirk in the armed wipe path to tidy next session,
+not a functional bug.
+
+**Universal gate added to the repo:** `firmware/guardian/guardian.ino` + README — the standalone,
+firmware-agnostic gate (builds at 349 KB with no Marauder/TFT/NimBLE), hardware-validated above.
 
 ## OWNER CHOICES (saved — decide next session, nothing was blocked on these)
 - **C1 — COM3 (ESP-AT WROOM):** needs a one-time BOOT-button tap to enter download mode (no auto-program
