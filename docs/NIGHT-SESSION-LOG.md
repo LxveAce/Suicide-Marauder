@@ -218,6 +218,17 @@ not a functional bug.
 **Universal gate added to the repo:** `firmware/guardian/guardian.ino` + README — the standalone,
 firmware-agnostic gate (builds at 349 KB with no Marauder/TFT/NimBLE), hardware-validated above.
 
+**DASHBOARD (cyber-controller) logic validated:** the full pytest suite **107/107 PASS** — cross_comm
+(EventBus/TargetPool/AutoRouter — the cross-device "one board's AP, another executes on it" routing),
+encrypted_storage (AES-256-GCM), flash_core, profile_loader, protocols, serial_handler, web_auth. Fixed
+the suite so it runs with a bare `pytest` (added `[tool.pytest.ini_options]` pythonpath/testpaths — was
+failing to import `conftest`). UI-runtime + 2-board live cross-comm stress is still a next-session item
+(needs PyQt5 + two boards talking; the logic is green). cyber-controller HEAD `bbbddee`.
+
+### REPO HEADS AT END OF THIS BLOCK (all clean + pushed, authored LxveAce, no Claude co-author)
+Suicide-Marauder `060e87e` · cyber-controller `bbbddee` · universal-flasher `fd6ad03` ·
+headless-marauder-gui `8cb2906` · esp32marauder.com `56ea84f` · LxveAce(profile) `d3ca720`.
+
 ## OWNER CHOICES (saved — decide next session, nothing was blocked on these)
 - **C1 — COM3 (ESP-AT WROOM):** needs a one-time BOOT-button tap to enter download mode (no auto-program
   circuit). Tap BOOT (hold), tap EN/RST, release BOOT — then I can flash + test it.
