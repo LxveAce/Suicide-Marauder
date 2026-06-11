@@ -278,15 +278,20 @@ scratch partition / logs only.
    **FTL** wear-leveling / over-provisioning (remapped or spare cells may survive) — documented, not
    hidden. At-rest SD encryption (T2) is the only absolute guarantee.
 2. **Internal data — OVERWRITE-then-ERASE + verify** (red-team / "write over all deleted items"):
-   for `ota_0`/`ota_1` (non-running app slots, if `wipe_ota`), `spiffs` (if `wipe_spiffs`), Marauder
-   `nvs` (if `wipe_nvs`), `coredump`, `otadata`, `nvs_keys` (T2 NVS key — else a dumped NVS could be
-   decrypted), then `guardcfg` **last**. Each partition is scrubbed by `flash_passes` random
-   overwrite passes (`erase → esp_partition_write(esp_fill_random)`) followed by a **final clean
-   erase to 0xFF**, then **read back and verified all-0xFF** (`g_verify_wipe`). The overwrite
-   reprograms every NOR cell, scrambling the analog charge/Vth signature of the original data; the
-   trailing erase leaves no residual random pattern. `flash_passes=0` (or `fast_wipe`) degrades to a
-   single plain erase for brownout speed. A failed overwrite/erase/verify is **not** counted as
-   "complete" — the tombstone stays set and the next boot retries.
+   for `ota_0`/`ota_1`/`factory` (non-running app slots, if `wipe_ota`), `spiffs` (if `wipe_spiffs`),
+   Marauder `nvs` (if `wipe_nvs`), `coredump`, `otadata`, `nvs_keys` (T2 NVS key — else a dumped NVS
+   could be decrypted), `scratch` (the SAFE dry-run region), then `guardcfg` **last**.
+   - **The load-bearing step is the final `esp_partition_erase_range` to 0xFF.** On NOR flash a single
+     erase is **forensically sufficient** (no magnetic remanence — RESEARCH-DIGEST). The optional
+     `flash_passes` random overwrite passes (`erase → esp_partition_write(esp_fill_random)` → final
+     erase) are **defense-in-depth only** ("write over deleted items"); they add power-loss exposure
+     with no NOR benefit, so `fast_wipe` **and the resume path force 0 passes**, and `flash_passes=0`
+     (erase-only) still fully meets the no-trace bar.
+   - **Verification reads RAW flash** via `esp_flash_read` (not `esp_partition_read`), so an erased
+     0xFF sector verifies correctly even on a **flash-encrypted (T2)** partition — `esp_partition_read`
+     would transparently *decrypt* 0xFF into non-0xFF and falsely report failure.
+   - A failed erase/verify is **not** counted as complete — the tombstone stays set and the next boot
+     retries (erase-only + SD-skipped, so a resume converges within the `MAX_WIPE_RESUMES` budget).
 3. **Brick** (if `brick`): from an `IRAM_ATTR` routine that does not return to flash — raw-erase the
    partition table (0x8000), the bootloader (0x1000 classic / 0x0 S3-C3), and the running app/factory
    region. **This self-erase-of-the-running-app is the one UNVERIFIED primitive** → see

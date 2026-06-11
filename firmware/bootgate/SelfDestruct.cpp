@@ -147,34 +147,51 @@ const esp_partition_t* findScratchPartition() {
 #endif  // SUICIDE_SAFE_MODE (findScratchPartition)
 
 // ---------------------------------------------------------------------------------------------
-// Forensic OVERWRITE-THEN-ERASE ("write over all deleted items" — SPEC §8). esp_partition_erase
-// alone returns NOR cells to 0xFF; an overwrite pass first REPROGRAMS every cell with true-random
-// data, scrambling the analog charge / threshold-voltage signature of the original contents, after
-// which a FINAL erase leaves the region in the clean 0xFF state (no residual random pattern that
-// could hint the region was ever used). NOR can only be programmed after an erase, so each pass is
-// erase -> write-random; a trailing erase removes the last random pass. g_flash_passes==0 degrades
-// to a single plain erase (the historical behavior / fast-wipe path). These run on internal-flash
-// data + non-running app partitions ONLY — never the running app (that is the brick stage's job).
+// OVERWRITE-THEN-ERASE + RAW VERIFY ("write over all deleted items" — SPEC §8).
 //
-// Module-scope knobs are set once by wipeInternal() from GateConfig so cfg need not thread through
-// every erase helper + retry wrapper. Anonymous-namespace statics => file-internal linkage.
-static uint8_t g_flash_passes = 1;   // random overwrite passes before the final clean erase
-static bool    g_verify_wipe  = true; // read back + confirm all-0xFF after erase
+// HONEST NOR reality (RESEARCH-DIGEST): a single sector erase to 0xFF is FORENSICALLY SUFFICIENT on
+// NOR flash — no magnetic remanence, and erase removes the floating-gate charge. The random
+// overwrite pass(es) are DEFENSE-IN-DEPTH only and ADD power-loss exposure, so g_flash_passes
+// defaults to 1 and the RESUME / fast_wipe paths force 0 (the final erase is the load-bearing step).
+// On flash-encrypted (T2) partitions the stored data is already AES-XTS ciphertext, so the "scramble
+// the original signature" argument does not really apply there — the final erase is what matters.
+//
+// These run on internal-flash data + non-running app partitions ONLY (never the running app). Both
+// use a small STACK buffer so they can never silently degrade under heap pressure.
+// Module-scope knobs are set once by wipeInternal() from GateConfig. Anonymous-ns => file linkage.
+static uint8_t g_flash_passes = 1;    // random overwrite passes before the final clean erase
+static bool    g_verify_wipe  = true; // raw read-back + confirm all-0xFF after erase
+static bool    g_resume_fast  = false; // set by trigger() on a RESUME — force erase-only (no
+                                       // overwrite) so a resumed wipe converges within the bounded
+                                       // resume budget instead of re-doing minutes of overwrite
 
-constexpr size_t SCRUB_BUF = 4096;   // sector-sized scrub / verify buffer
+constexpr size_t SCRUB_BUF = 512;     // stack scrub/verify buffer (16-aligned for encrypted writes)
+
+// RAM-residue defense (red-team ANGLE 2): volatile-zero the sensitive fields of the in-RAM
+// GateConfig (salt + pwhash). cfg is a const ref to BootGate's stack object, which is NOT actually
+// const, so const_cast to scrub the real bytes is well-defined; `volatile` defeats dead-store
+// elimination. trigger() never returns (halt/brick), so it must scrub here — otherwise the salted
+// hash + salt stay readable in powered SRAM via JTAG / cold-boot during the post-wipe halt.
+void scrubConfigRam(const GateConfig& cfg) {
+  volatile uint8_t* s = const_cast<volatile uint8_t*>(&cfg.salt[0]);
+  for (size_t i = 0; i < sizeof(cfg.salt); ++i) s[i] = 0;
+  volatile uint8_t* h = const_cast<volatile uint8_t*>(&cfg.pwhash[0]);
+  for (size_t i = 0; i < sizeof(cfg.pwhash); ++i) h[i] = 0;
+}
 
 // Overwrite (g_flash_passes random passes) then a final clean erase. Returns true iff the region is
-// left fully erased. On OOM it falls back to a single plain erase — destruction must never be
-// silently skipped. SAFE MODE never reaches here (the callers' SAFE branch is log-only).
+// left fully erased. esp_partition_erase_range requires a 4096-multiple size, so a non-sector-aligned
+// partition is rejected up front (it would fail the erase anyway). SAFE MODE never reaches here.
 bool overwriteThenErase(const esp_partition_t* part) {
+  if (part->size % 4096u != 0u) {
+    ESP_LOGE(TAG, "'%s' size 0x%x not a 4096 multiple — refusing unsafe erase", part->label,
+             (unsigned)part->size);
+    return false;
+  }
   if (g_flash_passes == 0) {
     return esp_partition_erase_range(part, 0, part->size) == ESP_OK;
   }
-  uint8_t* buf = (uint8_t*)malloc(SCRUB_BUF);
-  if (!buf) {
-    ESP_LOGW(TAG, "overwrite '%s': OOM — single-erase fallback", part->label);
-    return esp_partition_erase_range(part, 0, part->size) == ESP_OK;
-  }
+  uint8_t buf[SCRUB_BUF];   // stack — never OOMs (the old malloc could silently degrade the wipe)
   bool ok = true;
   for (uint8_t pass = 0; pass < g_flash_passes && ok; ++pass) {
     if (esp_partition_erase_range(part, 0, part->size) != ESP_OK) { ok = false; break; }
@@ -184,29 +201,31 @@ bool overwriteThenErase(const esp_partition_t* part) {
       if (esp_partition_write(part, off, buf, chunk) != ESP_OK) { ok = false; break; }
     }
   }
-  // Final clean erase ALWAYS — never leave the random overwrite pattern on the chip, even if a
-  // pass failed partway (a partial random region is still "a trace").
+  // Final clean erase ALWAYS — never leave the random overwrite pattern on the chip.
   if (esp_partition_erase_range(part, 0, part->size) != ESP_OK) ok = false;
-  memset(buf, 0, SCRUB_BUF);  // don't leave a random copy in heap
-  free(buf);
+  memset(buf, 0, SCRUB_BUF);  // don't leave random on the stack frame
   return ok;
 }
 
-// Read the whole partition back and confirm every byte is 0xFF ("make sure the wiping is good").
-// OOM -> cannot verify; returns true (don't fail an otherwise-good wipe on a verify alloc alone).
+// Confirm the partition is truly erased. Reads RAW flash via esp_flash_read (NOT esp_partition_read)
+// so the check is correct on flash-encrypted (T2) partitions: an erased NOR sector is 0xFF at the
+// raw/ciphertext level, but esp_partition_read would TRANSPARENTLY DECRYPT it into non-0xFF plaintext
+// and the check would always (wrongly) fail — re-triggering the wipe until GATE_HALTED on the exact
+// tier meant to be unrecoverable. Raw read sees the true 0xFF. Stack buffer (no OOM); a read error
+// returns false (treated as not-verified so the tombstone stays set).
 bool verifyErased(const esp_partition_t* part) {
-  uint8_t* buf = (uint8_t*)malloc(SCRUB_BUF);
-  if (!buf) return true;
-  bool clean = true;
-  for (size_t off = 0; off < part->size && clean; off += SCRUB_BUF) {
+  uint8_t buf[SCRUB_BUF];
+  esp_flash_t* chip = esp_flash_default_chip;
+  for (size_t off = 0; off < part->size; off += SCRUB_BUF) {
     size_t chunk = (part->size - off) < SCRUB_BUF ? (part->size - off) : SCRUB_BUF;
-    if (esp_partition_read(part, off, buf, chunk) != ESP_OK) { clean = false; break; }
+    if (esp_flash_read(chip, buf, (uint32_t)part->address + off, chunk) != ESP_OK) {
+      return false;
+    }
     for (size_t i = 0; i < chunk; ++i) {
-      if (buf[i] != 0xFF) { clean = false; break; }
+      if (buf[i] != 0xFF) return false;
     }
   }
-  free(buf);
-  return clean;
+  return true;
 }
 
 // Erase one named data partition by (subtype, label). In SAFE MODE this is LOG-ONLY: it performs
@@ -585,11 +604,14 @@ bool SelfDestruct::wipeInternal(const GateConfig& cfg) {
   // skip the random overwrite — a plain erase is seconds faster and more likely to finish on a
   // marginal supply (the boot chain still ends erased). Otherwise use cfg.flash_passes random
   // overwrite passes + a final clean erase, then verify all-0xFF.
-  g_flash_passes = cfg.fast_wipe ? 0 : cfg.flash_passes;
+  // Force erase-only (0 passes) when fast_wipe OR this is a resume — a single NOR erase is
+  // forensically sufficient (RESEARCH-DIGEST) and converges fast, so a resumed/brownout wipe is not
+  // burned re-doing minutes of overwrite on the big partitions (spiffs can be ~12 MB).
+  g_flash_passes = (cfg.fast_wipe || g_resume_fast) ? 0 : cfg.flash_passes;
   g_verify_wipe  = true;
   EntropyGuard entropy;  // true-random overwrite payload for the internal scrub
-  ESP_LOGW(TAG, "internal scrub: flash_passes=%u (fast_wipe=%u), verify=on",
-           (unsigned)g_flash_passes, (unsigned)cfg.fast_wipe);
+  ESP_LOGW(TAG, "internal scrub: flash_passes=%u (fast_wipe=%u, resume=%u), verify=on",
+           (unsigned)g_flash_passes, (unsigned)cfg.fast_wipe, (unsigned)g_resume_fast);
 
   bool ok = true;
 
@@ -602,7 +624,12 @@ bool SelfDestruct::wipeInternal(const GateConfig& cfg) {
     struct AppSlot { esp_partition_subtype_t subtype; const char* name; };
     const AppSlot appSlots[] = {
         {ESP_PARTITION_SUBTYPE_APP_OTA_0, "ota_0"},
-        {ESP_PARTITION_SUBTYPE_APP_OTA_1, "ota_1"},  // GUARDIAN/16 MB second app slot (absent on 4 MB)
+        {ESP_PARTITION_SUBTYPE_APP_OTA_1, "ota_1"},   // GUARDIAN/16 MB second app slot (absent on 4 MB)
+        {ESP_PARTITION_SUBTYPE_APP_FACTORY, "factory"},  // GUARDIAN gate image. Wiped here ONLY if it
+                                                         // is NOT the running app; when factory IS the
+                                                         // running gate it is deferred to the brick
+                                                         // stage (so GUARDIAN-T1 leaves the gate image
+                                                         // — only brick/T2 removes it; see THREAT-MODEL).
     };
     for (const AppSlot& slot : appSlots) {
       const esp_partition_t* p =
@@ -635,6 +662,11 @@ bool SelfDestruct::wipeInternal(const GateConfig& cfg) {
   // nvs_keys: the T2 NVS-encryption key partition. MUST be erased — otherwise a dumped (encrypted)
   // NVS image could be decrypted with the surviving keys. Absent on T1 builds (treated as success).
   ok &= eraseDataPartitionRetry(ESP_PARTITION_SUBTYPE_DATA_NVS_KEYS, "nvs_keys");
+
+  // scratch (data subtype 0x40): the SAFE-mode dry-run target. In a REAL wipe it may still hold
+  // residue from a prior SAFE simulation, and a 0x40 partition labelled 'scratch' is itself a tell —
+  // erase it too. (A SAFE build hits the log-only branch, so a dry run never touches its own target.)
+  ok &= eraseDataPartitionRetry((esp_partition_subtype_t)0x40, "scratch");
 
   // guardcfg LAST of the data partitions. cfg is already in RAM, so this is safe.
   ok &= eraseDataPartitionRetry(ESP_PARTITION_SUBTYPE_DATA_NVS, "guardcfg");
@@ -806,13 +838,24 @@ void SelfDestruct::trigger(const GateConfig& cfg, TriggerReason reason) {
                   "auto-resume-on-interrupt may be unavailable");
   }
 
-  // Fast-wipe mode (cfg.fast_wipe or brownout-prioritized): skip the SD wipe entirely and go
-  // straight to flash erase + boot brick. This is faster and more likely to complete before power
-  // is lost on a marginal supply. The SD wipe is the slowest stage (can take minutes for large
-  // cards); flash erase takes seconds.
+  // RESUME detection (red-team ANGLE 4): BootGate increments resume_count BEFORE re-triggering an
+  // interrupted wipe, so resume_count > 0 here means this is a destructive RESUME. A resume must
+  // CONVERGE within the bounded resume budget (MAX_WIPE_RESUMES), so it (a) forces erase-only internal
+  // scrub (g_resume_fast, read by wipeInternal — a single NOR erase is forensically sufficient) and
+  // (b) SKIPS the multi-hour full-LBA SD wipe. Re-running the SD wipe from sector 0 on every resume
+  // would burn the whole budget on best-effort FTL-limited SD and never reach the flash holding the
+  // real secrets (the salted hash + NVS key), halting GATE_HALTED with them still present.
+  const bool isResume = (rt.resume_count > 0);
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+  g_resume_fast = isResume;  // consumed by wipeInternal (ESP32 path); host build skips the static
+#endif
+  const bool skipSD = cfg.fast_wipe || isResume;
+
+  // Fast-wipe / resume: skip the SD wipe (slowest stage) and go straight to flash erase + brick.
   bool ok = true;
-  if (cfg.fast_wipe) {
-    ESP_LOGW(TAG, "fast_wipe=1: SKIPPING SD wipe (prioritizing flash erase for speed/reliability)");
+  if (skipSD) {
+    ESP_LOGW(TAG, "SKIPPING SD wipe (fast_wipe=%u, resume=%u) — prioritizing flash-erase convergence",
+             (unsigned)cfg.fast_wipe, (unsigned)isResume);
   } else {
     // Stage 1: SD (best-effort, FTL-limited; documented). Capture the result.
     ok &= wipeSD(cfg);
@@ -826,6 +869,14 @@ void SelfDestruct::trigger(const GateConfig& cfg, TriggerReason reason) {
   // erased by now; on T1 it is data-wiped. (On a real brick with cfg.brick we still signal first,
   // because brickBootChain never returns.)
   panicIndicate(reason);
+
+  // RAM-residue defense (red-team ANGLE 2): the salt + pwhash in BootGate's stack GateConfig are not
+  // needed past this point, and trigger() never returns — volatile-zero them now so they cannot be
+  // recovered from powered SRAM during the brick or the T1 halt below. (guardcfg flash is also wiped;
+  // this kills the in-RAM copy.) SAFE builds scrub a dummy cfg harmlessly.
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP_PLATFORM)
+  scrubConfigRam(cfg);
+#endif
 
   // Stage 3: brick the boot chain only if configured (T1 default 0; T2 default 1). A real brick does
   // not return, so the tombstone-clear/halt below is reached only on T1 or SAFE builds. If earlier
