@@ -1,5 +1,7 @@
 # Suicide Marauder
 
+> **Note:** This project has been succeeded by [Dead Man's Switch](https://github.com/LxveAce/deadmans-switch) — a universal anti-forensic dead-man gate with expanded board support. Suicide Marauder remains available as the original implementation.
+
 > ## ⚠️ OWNER-ONLY · DEFENSIVE · ANTI-FORENSIC ("DURESS") LAYER
 >
 > This is a **defensive** add-on for an [ESP32 Marauder](https://github.com/justcallmekoko/ESP32Marauder)
