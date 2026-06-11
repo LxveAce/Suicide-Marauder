@@ -135,3 +135,85 @@ erased + overwritten). Only the running-app + boot-chain self-erase needed the R
    resource (one device's AP usable+executable by another), stress test the UIs.
 6. Recover the CYD (reflash official Marauder v1.12.1).
 7. Red-team each + loop. Log + save choices.
+
+---
+
+## UNIVERSAL DEAD-MAN SWITCH — design (groundwork for next session)
+The owner's vision: make the gate a **universal, board+firmware-specific dead-man switch**, not just a
+Marauder fork. The repo already has the right architecture for this — the **GUARDIAN** variant — and the
+hard part (the live forensic wipe/brick) is now solved and chip-portable in `SelfDestruct.cpp`.
+
+**FORK (today, Marauder-only):** the gate is *compiled into* a Marauder fork and called once from
+`setup()`. Tied to one firmware.
+
+**GUARDIAN (the universal path):** the gate is a **standalone `factory`-partition app**; the user's
+chosen firmware lives in `ota_0`. Boot order: ROM → bootloader → **factory (gate runs: password /
+dead-man / wipe)** → on PASS, `esp_ota_set_boot_partition(ota_0)` + reboot into the *unmodified*
+firmware. The gate never links against the firmware, so it protects **ANY** ESP32 firmware — Marauder,
+Bruce, GhostESP, ESP32-DIV, even ESP-AT. The same `SelfDestruct` (ROM-bypass obliteration) is reused
+verbatim; only the GateInput adapter is per-board (touch / serial / mini-kb / buttons).
+
+**To build it (next session):**
+1. Write a tiny standalone gate sketch (`firmware/guardian/guardian.ino`) = `BootGate::run()` + the
+   chosen `GATE_INPUT_*`, NO Marauder. Partition table = `suicide_guardian_16MB.csv` (factory + ota_0).
+2. Build the gate → `factory`@0x10000; flash the target firmware → `ota_0`; provision `guardcfg`.
+3. **Anti-skip hardening (already documented in INTEGRATION.md §6):** without Secure Boot, an attacker
+   who can write flash can rewrite `otadata` to boot `ota_0` directly and skip the gate. Closing it
+   needs Secure Boot v2 + `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` + the gate re-asserting `factory` on
+   boot. **This is the "no boot attacks bypass the password" requirement → it is a T2 (eFuse) property.**
+4. Per-board/firmware matrix: input adapter + arm_pin + flash size + partition CSV, keyed off the board.
+
+**Per-chip ROM brick:** the working brick is ESP32-only (register addresses + `esp32/rom/spi_flash.h`).
+S2/S3/C3/C6 need their own RTC/TG-WDT + reset register addresses and `esp32sX/rom/...` headers. The
+`#else` path keeps the esp_flash fallback so non-ESP32 still builds. (All boards on hand are classic
+ESP32, so this didn't block tonight.)
+
+## DASHBOARD (cyber-controller) — next-session plan
+The README already documents the dashboard's intended feature set; the code has the cores
+(flash_engine HW-validated, cross_comm EventBus/TargetPool/AutoRouter, web_auth, encrypted_storage,
+firmware_vault, health_monitor, suicide_setup). To "make every feature work under every config" +
+"cross-comm/cross-resource flawless" + "optional install password" + "no boot/password-bypass":
+1. **Install password (C3):** `web_auth.py` already supports a one-time set password (no default creds
+   shipped — README §"no default password"). Add an installer/first-run prompt that sets it and an
+   env/keyring store via the existing `encrypted_storage` (AES-256-GCM). Confirm default on/off (C3).
+2. **Cross-comm/cross-resource:** `AutoRouter` already routes events device→device (the "one device
+   gets an AP, another executes on it" path). Needs an integration test across two real connected
+   boards (have them now): e.g. board A runs an Evil Portal AP, board B's station scan feeds A's target
+   list via a routing rule. Build a scripted end-to-end test in `tests/` and stress it.
+3. **UI stress:** PyQt5/Tk/TUI/Web each need a smoke + load test (no PyQt5 locally → compile-check + a
+   CI/headless run; web via the Flask test client). Run `pip install -e .[dev,web] && pytest`.
+4. **Boot-attack/password hardening:** the *dashboard* password is software (web_auth + rate-limit +
+   CSRF + lockout — already in `web/app.py`); the *device* anti-bypass is the Secure-Boot/T2 work above.
+
+---
+
+## FINAL STATUS (end of this autonomous block)
+**DONE + committed/pushed (LxveAce only, no Claude co-author):**
+- Forensic obliteration brick — **hardware-validated on the CYD** (full flash 0xFF, single clean pass),
+  production-clean (no serial markers), SD no-card abort fixed, touch keyboardInput shim fixed, CSV
+  ASCII fixed. Canonical `edf9032` → propagated to universal-flasher `fd6ad03`, headless `8cb2906`,
+  cyber-controller submodule `1d785fc`.
+- CYD **recovered** to a working touchscreen Marauder.
+- Profile README (added Cyber Controller flagship + updated Suicide Marauder), cyber-controller README,
+  Suicide-Marauder README (brick now HARDWARE-VALIDATED), esp32marauder.com (obliteration + SEO).
+- This log.
+
+**STRESS/COVERAGE NOTES:** the wipe was triggered + fully verified **twice** on the CYD (2 clean
+obliterations, all-0xFF read-back). All 4 attached flashable boards are **classic ESP32**, for which the
+brick is proven; other chip families are a per-chip TODO (no S3/C3/C5 attached). COM7 (blank ESP32) +
+COM8 (4" ST7796) are flashable and free for further destructive serial-path testing next session.
+
+## OWNER CHOICES (saved — decide next session, nothing was blocked on these)
+- **C1 — COM3 (ESP-AT WROOM):** needs a one-time BOOT-button tap to enter download mode (no auto-program
+  circuit). Tap BOOT (hold), tap EN/RST, release BOOT — then I can flash + test it.
+- **C2 — T2 / eFuse tier:** tonight's obliteration is **T1** (owner-reflashable over UART). A truly
+  unrecoverable posture *and* the "no boot attack can bypass the password" guarantee both require Secure
+  Boot v2 + Flash Encryption + UART-download-disable eFuses — **IRREVERSIBLE**. Confirm before any burn.
+- **C3 — dashboard install password:** default on or off? + reset path.
+- **C4 — Pwnagotchi (Pi Zero 2 W):** it's a Linux SBC (SD image, not esptool). To let me SSH-debug the
+  Waveshare 2.13" **V4** e-ink (`ui.display.type="waveshare_v4"`, jayofelony fork only), reflash its SD
+  with that image configured for a USB-**ethernet** gadget (it currently exposes a driverless serial
+  gadget). Or hand me the SD in a reader.
+- **C5 — 4" ST7796 board (COM8):** not a stock Marauder target. Adding it needs that board's exact
+  TFT_eSPI display+touch pinout (ST7796, 320x480) — share the product/wiki link or I'll best-guess from
+  the AITRIP/Sunton reference next session, then add a `User_Setup` + board define.
