@@ -225,6 +225,18 @@ the suite so it runs with a bare `pytest` (added `[tool.pytest.ini_options]` pyt
 failing to import `conftest`). UI-runtime + 2-board live cross-comm stress is still a next-session item
 (needs PyQt5 + two boards talking; the logic is green). cyber-controller HEAD `bbbddee`.
 
+### TRIGGER-PATH COVERAGE MATRIX (2026-06-11 — all hardware-validated, esptool read-back)
+| Trigger | Board | Input | Result |
+|---------|-------|-------|--------|
+| Dead-man (armed=1, deadman=1, no arming switch) | CYD (COM5) | touch | OBLITERATED ×2 (all 0xFF) |
+| 2 wrong passwords (REASON_ATTEMPTS) | blank ESP32 (COM7) | serial | OBLITERATED (all 0xFF) |
+| Authenticated `wipe` + correct password (REASON_HOST_WIPE) | COM7 | serial | OBLITERATED (all 0xFF) |
+| **Correct password (GATE_PASS — control)** | COM7 | serial | boots through, flash **INTACT** (no false-wipe) |
+So all three wipe triggers AND the correct-password pass-through are proven, across touch + serial input
+and the standalone (Marauder-free) universal gate. Boards COM5 (CYD, recovered) + COM7 (blank, free).
+COM8 (4" ST7796) dropped off the USB bus mid-session (re-test when reconnected — C5). COM3 still
+download-blocked (C1).
+
 ### REPO HEADS AT END OF THIS BLOCK (all clean + pushed, authored LxveAce, no Claude co-author)
 Suicide-Marauder `060e87e` · cyber-controller `bbbddee` · universal-flasher `fd6ad03` ·
 headless-marauder-gui `8cb2906` · esp32marauder.com `56ea84f` · LxveAce(profile) `d3ca720`.
