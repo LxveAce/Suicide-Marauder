@@ -488,9 +488,10 @@ def write_otadata_blank(out_path, size_bytes):
 def _sha256_file(path):
     """Return the lowercase hex SHA-256 of a file's bytes (streamed, constant memory).
 
-    Defense-in-depth: the flasher recomputes this and ABORTS on mismatch, so a tampered bundle
-    .bin cannot be flashed. No password material is ever in these images (only the salted hash),
-    so hashing/logging the digest is safe.
+    Defense-in-depth: the flasher is SPECIFIED to recompute this and abort on mismatch, so a
+    tampered bundle .bin cannot be flashed. That verification is a documented plan, not a shipped
+    flasher yet (see flasher-integration/PLAN.md). No password material is ever in these images
+    (only the salted hash), so hashing/logging the digest is safe.
     """
     h = hashlib.sha256()
     with open(path, "rb") as fh:
