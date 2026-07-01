@@ -120,6 +120,22 @@ python provision.py \
 
 ---
 
+## Testing
+
+The provisioner logic is pure and hardware-free, so it has a stdlib-only pytest suite that locks
+the safety invariants (partition-offset resolution, the fail-safe arm pair rejection, password/KDF
+bounds, the `guardcfg` NVS size floor, and the exactly-one-`otadata`-seed manifest rule):
+
+```
+pip install -r requirements-dev.txt
+python -m pytest -q            # from host/  (or: python -m pytest -q host/tests)
+```
+
+No hardware and no NVS generator are needed — the `generate_nvs_bin` cases exercise the size
+guards, which reject before the generator is ever invoked.
+
+---
+
 ## Flashing the bundle
 
 `provision.py` only produces the per-device data images. The full flash (bootloader, partition
@@ -135,3 +151,5 @@ The manifest's offsets are authoritative; do not hardcode `0xe000`.
 - `nvs_config.csv.template` — documentation of the exact `sgate` rows emitted (placeholders for
   salt/hash filled at provision time; **never contains the plaintext password**).
 - `requirements.txt` — the single external dependency plus a convenience `esptool` pin.
+- `requirements-dev.txt` — test dependency (`pytest`).
+- `tests/test_provision.py` — the stdlib-only regression suite (see **Testing** above).

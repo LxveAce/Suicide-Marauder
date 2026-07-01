@@ -1,0 +1,12 @@
+# host/requirements-dev.txt -- development/test dependencies for the host provisioner.
+#
+# provision.py itself needs only the Python 3.9+ standard library (plus the NVS generator in
+# requirements.txt for an actual provision run). The test suite adds pytest and nothing else:
+# tests/test_provision.py exercises the pure logic (partition parsing, password/KDF bounds, the
+# fail-safe arm pairs, the guardcfg size floor, and the one-otadata-seed manifest rule) with no
+# hardware and no NVS generator required.
+#
+#     pip install -r requirements-dev.txt
+#     python -m pytest -q            # from host/  (or: python -m pytest -q host/tests)
+
+pytest>=7,<10
