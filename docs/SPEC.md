@@ -34,9 +34,13 @@ Marauder's own display/keyboard/SD drivers, so the password prompt works on ever
 class with almost no new UI code. Self-destruct = the running app erases every other partition,
 the SD, and finally its own boot chain.
 
-- Hook: in `ESP32Marauder.ino`, insert `BootGate::run()` **after** `display_obj.RunSetup()` and
-  **before** `settings_obj.begin()`. (Anchor strings, not line numbers — see
-  `firmware/integration/INTEGRATION.md`. Reference region: lines 312–348 of the inspected source.)
+- Hook: in `ESP32Marauder.ino`, insert the **fail-closed** gate call
+  `if (suicide::BootGate::run() != suicide::GATE_PASS) { esp_restart(); }` **after**
+  `display_obj.RunSetup()` and **before** `settings_obj.begin()` — only `GATE_PASS`
+  (unprovisioned, master-disarmed, or correct password) continues into Marauder; any other result
+  reboots via `esp_restart()` rather than leaking into the UI. (Anchor strings, not line numbers —
+  see `firmware/integration/INTEGRATION.md`. Reference region: lines 312–348 of the inspected
+  source.)
 - Partition table = Marauder's normal layout **plus** a `guardcfg` NVS partition.
 
 ### Variant GUARDIAN *(optional hardening — 8 MB+ only)*
