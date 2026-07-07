@@ -1,6 +1,6 @@
 # Suicide Marauder
 
-> **Note:** This project has been succeeded by [Dead Man's Switch](https://github.com/LxveAce/deadmans-switch) — a universal anti-forensic dead-man gate with expanded board support. Suicide Marauder remains available as the original implementation.
+> **Note:** This project has been succeeded by [Dead Man's Switch](https://github.com/LxveAce/deadmans-switch) — a universal anti-forensic dead-man gate with expanded board support. Suicide Marauder remains available as the original implementation, and is now **archived (read-only)** — use Dead Man's Switch going forward.
 
 > ## ⚠️ OWNER-ONLY · DEFENSIVE · ANTI-FORENSIC ("DURESS") LAYER
 >
@@ -23,7 +23,7 @@
 
 | | |
 |---|---|
-| **Maturity** | **Implemented + hardware-validated (SAFE_MODE *and* live wipe).** The full gate (password verify, 2-fail wipe, arming, NVS config) was validated on a classic ESP32 in `SUICIDE_SAFE_MODE` ([`docs/HARDWARE-TEST.md`](docs/HARDWARE-TEST.md), zero erases), and the **real, live wipe was then hardware-validated on a CYD 2432S028** (classic ESP32) — see [`docs/NIGHT-SESSION-LOG.md`](docs/NIGHT-SESSION-LOG.md). The interface contract ([`docs/SPEC.md`](docs/SPEC.md)) is the single source of truth. |
+| **Maturity** | **Implemented + hardware-validated (SAFE_MODE *and* live wipe).** The full gate (password verify, 2-fail wipe, arming, NVS config) was validated on a classic ESP32 in `SUICIDE_SAFE_MODE` ([`docs/HARDWARE-TEST.md`](docs/HARDWARE-TEST.md), zero erases), and the **real, live wipe was then hardware-validated on a CYD 2432S028** (classic ESP32). The interface contract ([`docs/SPEC.md`](docs/SPEC.md)) is the single source of truth. |
 | **Brick primitive** | **HARDWARE-VALIDATED on classic ESP32.** A dead-man-triggered live wipe obliterated the *entire* flash — verified by esptool read-back, every region `0xFF`: bootloader, partition table, the full running app, NVS/SPIFFS/logs/coredump, and `guardcfg`, with a forensic random-overwrite pass. The running-app self-erase (the part no Espressif source documents) works on the stock arduino-esp32 core via a **ROM-SPI bypass inside the IDF flash-only critical section** (`spi_flash_disable_interrupts_caches_and_other_cpu`), with RTC + TG0/TG1 watchdogs disabled so the multi-second erase completes in one pass. Currently **ESP32-only**; S2/S3/C3/C6 fall back to the `esp_flash` path and get their per-chip ROM brick next. See [`docs/SPIKE-PLAN.md`](docs/SPIKE-PLAN.md). |
 | **Default tier** | **T1** (no Secure Boot / Flash Encryption — reflashable; data-wipe only). **T2** (Secure Boot v2 + Flash Encryption, true unrecoverable brick) is opt-in and **IRREVERSIBLE** at the eFuse level. |
 | **Variants** | **FORK** (default — gate compiled into Marauder; works on every flash size incl. 4 MB), **GUARDIAN** (factory + `ota_0` split, 8 MB+, 16 MB preferred), and a **standalone universal gate** (`firmware/guardian/guardian.ino` — firmware-agnostic, hardware-validated on a blank ESP32). |
@@ -261,7 +261,6 @@ Suicide-Marauder/
 │   ├── PROVISIONING.md
 │   ├── RESEARCH-DIGEST.md         ← grounded detail + citations
 │   ├── SPIKE-PLAN.md              ← per-chip brick spike plan
-│   ├── NIGHT-SESSION-LOG.md       ← live-wipe / brick bring-up log
 │   └── LICENSING.md               ← GPL/LGPL distribution notes
 ├── firmware/
 │   ├── bootgate/                  ← gate headers + impl
